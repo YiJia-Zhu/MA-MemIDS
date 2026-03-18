@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MA-MemIDS Interactive Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/demo/styles.css" />
+</head>
+<body>
+  <div class="bg-orb orb-a"></div>
+  <div class="bg-orb orb-b"></div>
+
+  <header class="hero reveal">
+    <p class="eyebrow">MA-MemIDS Interactive Console</p>
+    <h1>上传规则与 PCAP，查看每一步 LLM 与工具输出</h1>
+    <p class="subtitle">支持 Init（上传初始规则）和 Process（上传 PCAP/文本流量），并展示 trace + llm_calls。</p>
+    <div class="hero-tags">
+      <span>Init Upload</span>
+      <span>PCAP Upload</span>
+      <span>Step Trace</span>
+      <span>LLM Calls</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel reveal">
+      <div class="panel-head">
+        <h2>Backend Status</h2>
+        <p id="status-line">Checking...</p>
+      </div>
+      <button class="btn" id="btn-refresh">Refresh Status</button>
+      <pre id="status-json" class="codebox"></pre>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <h2>Init: 上传初始规则</h2>
+        <p>调用 <code>/api/init</code>，执行 pipeline.initialize_from_rules_file</p>
+      </div>
+      <form id="init-form" class="form-grid">
+        <label>
+          模型（可选）
+          <input type="text" name="model" placeholder="例如 deepseek-chat / gpt-4.1" />
+        </label>
+        <label>
+          规则文件（.rules/.txt）
+          <input type="file" name="rules_file" required />
+        </label>
+        <button class="btn" type="submit">Run Init</button>
+      </form>
+      <pre id="init-output" class="codebox"></pre>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <h2>Process: 上传 PCAP 或文本</h2>
+        <p>调用 <code>/api/process</code>，返回结果 + 每步 trace + LLM 调用</p>
+      </div>
+      <form id="process-form" class="form-grid">
+        <label>
+          模型（可选）
+          <input type="text" name="model" placeholder="例如 deepseek-chat / gpt-4.1" />
+        </label>
+        <label>
+          pcap 文件（可选）
+          <input type="file" name="pcap_file" accept=".pcap,.pcapng,.cap" />
+        </label>
+        <label>
+          攻击流量 pcap（可选，默认用 pcap_file）
+          <input type="file" name="attack_pcap" accept=".pcap,.pcapng,.cap" />
+        </label>
+        <label>
+          正常流量 pcap（可选）
+          <input type="file" name="benign_pcap" accept=".pcap,.pcapng,.cap" />
+        </label>
+        <label class="full">
+          traffic_text（当不上传 pcap 时可直接贴）
+          <textarea name="traffic_text" rows="5" placeholder="GET /search?q=<script>alert('xss')</script> HTTP/1.1\nHost: example.com"></textarea>
+        </label>
+        <label>
+          override intent（可选）
+          <input type="text" name="override_intent" placeholder="手工修正攻击意图" />
+        </label>
+        <label>
+          override tactics（可选，逗号分隔）
+          <input type="text" name="override_tactics" placeholder="T1190,T1059" />
+        </label>
+        <label>
+          override keywords（可选，逗号分隔）
+          <input type="text" name="override_keywords" placeholder="<script>,alert,xss" />
+        </label>
+        <button class="btn" type="submit">Run Process</button>
+      </form>
+
+      <div class="result-grid">
+        <article>
+          <h3>Final Result</h3>
+          <pre id="process-result" class="codebox"></pre>
+        </article>
+        <article>
+          <h3>Step Trace</h3>
+          <pre id="process-trace" class="codebox"></pre>
+        </article>
+      </div>
+
+      <h3>LLM Calls (prompt / response)</h3>
+      <pre id="llm-calls" class="codebox"></pre>
+    </section>
+  </main>
+
+  <footer class="reveal">
+    <p>Run backend: <code>python demo_server.py</code> · Open: <code>http://127.0.0.1:8090/</code></p>
+  </footer>
+
+  <script src="/demo/app.js"></script>
+</body>
+</html>

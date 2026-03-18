@@ -1,0 +1,215 @@
+:root {
+  --bg: #f7f1e7;
+  --paper: #fffaf0;
+  --ink: #1f2937;
+  --muted: #5b6475;
+  --line: #d6cdbf;
+  --accent: #0f766e;
+  --accent-2: #b45309;
+  --chip: #f1e4cf;
+  --shadow: 0 16px 30px rgba(17, 24, 39, 0.09);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at 8% 10%, #fce7c8 0%, transparent 36%),
+              radial-gradient(circle at 92% 16%, #d8efe8 0%, transparent 38%),
+              var(--bg);
+  min-height: 100vh;
+}
+
+code {
+  font-family: "IBM Plex Mono", monospace;
+  background: #f0e7d7;
+  border: 1px solid #e3d8c5;
+  border-radius: 6px;
+  padding: 0.1rem 0.35rem;
+}
+
+.bg-orb {
+  position: fixed;
+  z-index: -1;
+  filter: blur(24px);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.orb-a { width: 320px; height: 320px; background: #f59e0b; top: -80px; right: -60px; }
+.orb-b { width: 280px; height: 280px; background: #0f766e; left: -90px; bottom: -70px; }
+
+.hero, main, footer {
+  width: min(1100px, calc(100% - 2rem));
+  margin-inline: auto;
+}
+
+.hero { padding: 3rem 0 1.6rem; }
+
+.eyebrow {
+  margin: 0;
+  font: 600 0.78rem/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+
+h1 {
+  margin: 0.5rem 0;
+  font-size: clamp(1.6rem, 3.6vw, 2.6rem);
+  line-height: 1.08;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  max-width: 760px;
+}
+
+.hero-tags {
+  margin-top: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.hero-tags span {
+  background: var(--chip);
+  border: 1px solid #e8d7bc;
+  border-radius: 999px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.8rem;
+}
+
+main {
+  display: grid;
+  gap: 1rem;
+  padding-bottom: 1.8rem;
+}
+
+.panel {
+  background: linear-gradient(165deg, rgba(255, 250, 240, 0.94), rgba(255, 255, 255, 0.82));
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 1rem;
+  box-shadow: var(--shadow);
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  border-bottom: 1px dashed #d8ccb9;
+  margin-bottom: 0.8rem;
+}
+
+.panel-head h2 { margin: 0; font-size: 1.15rem; }
+.panel-head p { margin: 0 0 0.4rem; color: var(--muted); font-size: 0.86rem; }
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.8rem;
+}
+
+.form-grid label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  color: #334155;
+}
+
+.form-grid .full { grid-column: 1 / -1; }
+
+input[type="text"],
+input[type="file"],
+textarea {
+  width: 100%;
+  border: 1px solid #d6cab7;
+  border-radius: 10px;
+  padding: 0.55rem 0.65rem;
+  font: 500 0.86rem/1.4 "IBM Plex Mono", monospace;
+  background: #fffef9;
+  color: #273246;
+}
+
+textarea { resize: vertical; min-height: 96px; }
+
+.btn {
+  border: 1px solid #10655f;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #0f766e, #0c5f58);
+  color: #fff;
+  font: 600 0.9rem/1 "Space Grotesk", sans-serif;
+  padding: 0.68rem 0.95rem;
+  cursor: pointer;
+  justify-self: start;
+  transition: transform 160ms ease, filter 160ms ease;
+}
+
+.btn:hover { transform: translateY(-1px); filter: brightness(1.05); }
+
+.codebox {
+  margin: 0;
+  border: 1px solid #dccfbc;
+  border-radius: 12px;
+  background: #fffdf8;
+  padding: 0.75rem;
+  min-height: 80px;
+  max-height: 420px;
+  overflow: auto;
+  font: 500 0.78rem/1.45 "IBM Plex Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.result-grid h3,
+.panel h3 {
+  margin: 0.1rem 0 0.45rem;
+  font-size: 0.98rem;
+}
+
+footer {
+  padding: 0 0 1.6rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(10px);
+  animation: reveal 560ms ease forwards;
+}
+
+.reveal:nth-child(2) { animation-delay: 90ms; }
+.reveal:nth-child(3) { animation-delay: 160ms; }
+.reveal:nth-child(4) { animation-delay: 230ms; }
+
+@keyframes reveal {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 900px) {
+  .form-grid,
+  .result-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .hero { padding-top: 2rem; }
+  .panel { padding: 0.85rem; }
+}
