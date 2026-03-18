@@ -578,7 +578,6 @@ class MAMemIDSPipeline:
     def stats(self) -> Dict[str, object]:
         notes = self.graph.all_notes()
         rule_notes = [n for n in notes if n.note_type == "rule"]
-        traffic_notes = [n for n in notes if n.note_type == "traffic"]
         baseline_metrics = self.sandbox_baseline.get("metrics") if isinstance(self.sandbox_baseline, dict) else None
         baseline_score = None
         if isinstance(baseline_metrics, dict):
@@ -589,7 +588,7 @@ class MAMemIDSPipeline:
         return {
             "total_notes": len(notes),
             "rule_notes": len(rule_notes),
-            "traffic_notes": len(traffic_notes),
+            "traffic_notes": 0,
             "llm_model": self.llm.model_name(),
             "thresholds": self.thresholds.__dict__,
             "sandbox_baseline": {
@@ -601,6 +600,7 @@ class MAMemIDSPipeline:
         }
 
     def save_state(self) -> None:
+        self._enforce_rule_only_graph()
         payload = {
             "graph": self.graph.to_dict(),
             "sandbox_baseline": self.sandbox_baseline,
@@ -615,6 +615,11 @@ class MAMemIDSPipeline:
         baseline_data = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
         if isinstance(baseline_data, dict):
             self.sandbox_baseline = baseline_data
+        if self._enforce_rule_only_graph():
+            self.save_state()
+
+    def _enforce_rule_only_graph(self) -> bool:
+        return self.graph.retain_note_types({"rule"})
 
     def _apply_human_override(self, note: Note, override: Dict[str, object]) -> None:
         if "intent" in override and isinstance(override["intent"], str):
@@ -1091,52 +1096,77 @@ class MAMemIDSPipeline:
         linked: List[str] = []
         merge_candidates: List[str] = []
 
-        self.graph.add_or_update(traffic_note)
-
         if proposal.mode == "repair" and proposal.base_note_id:
             base = self.graph.get(proposal.base_note_id)
             if base is None:
                 # Fallback as new rule when base cannot be found.
-                new_note = self.note_builder.build_rule_note(proposal.rule_text)
+                new_note = self.note_builder.build_rule_note(
+                    proposal.rule_text,
+                    analysis_note=traffic_note,
+                )
                 self.graph.add_or_update(new_note)
                 linked.append(new_note.note_id)
                 merge_candidates = self.graph.find_merge_candidates(new_note.note_id)
             else:
-                base.content = proposal.rule_text
-                base.version += 1
-                base.timestamp = now_iso()
-                base.intent = base.intent + f"; covers variant from {traffic_note.note_id}"
-                base.keywords = dedupe_keep_order(base.keywords + traffic_note.keywords)
-                base.tactics = dedupe_keep_order(base.tactics + traffic_note.tactics)
-                base.external_knowledge.cve_ids = dedupe_keep_order(
-                    base.external_knowledge.cve_ids + traffic_note.external_knowledge.cve_ids
+                rebuilt = self.note_builder.build_rule_note(
+                    proposal.rule_text,
+                    note_id=base.note_id,
+                    analysis_note=traffic_note,
+                    intent_hint=self._merge_rule_intent(base.intent, traffic_note),
+                    keyword_hints=base.keywords,
+                    tactic_hints=base.tactics,
+                    extra_knowledge=base.external_knowledge,
+                    extra_metadata=base.metadata,
                 )
-                self.note_builder.reembed_note(base)
-                self.graph.add_or_update(base)
-                self._add_link(base.note_id, traffic_note.note_id, "l_strengthen", 0.95)
-                self._cascade_chain_context(base, traffic_note)
-                linked.append(base.note_id)
-                merge_candidates = self.graph.find_merge_candidates(base.note_id)
+                rebuilt.version = base.version + 1
+                rebuilt.timestamp = now_iso()
+                self.graph.add_or_update(rebuilt)
+                self._cascade_chain_context(rebuilt, traffic_note)
+                linked.append(rebuilt.note_id)
+                merge_candidates = self.graph.find_merge_candidates(rebuilt.note_id)
         else:
-            new_note = self.note_builder.build_rule_note(proposal.rule_text)
+            new_note = self.note_builder.build_rule_note(
+                proposal.rule_text,
+                analysis_note=traffic_note,
+            )
             self.graph.add_or_update(new_note)
-            self._add_link(new_note.note_id, traffic_note.note_id, "l_strengthen", 0.95)
             linked.append(new_note.note_id)
             merge_candidates = self.graph.find_merge_candidates(new_note.note_id)
 
         return merge_candidates, linked
 
     def _cascade_chain_context(self, base_note: Note, traffic_note: Note) -> None:
+        variant_label = self._traffic_variant_label(traffic_note)
         neighbors = self.graph.neighbors(base_note.note_id, link_type="exploit_chain")
         for link in neighbors:
             other = self.graph.get(link.target_id)
             if other is None:
                 continue
             context = other.metadata.get("context", "")
-            context += f" | related rule covered variant from {traffic_note.note_id}"
+            context += f" | related rule covered variant: {variant_label}"
             other.metadata["context"] = context.strip()
             self.note_builder.reembed_note(other)
             self.graph.add_or_update(other)
+
+    def _merge_rule_intent(self, base_intent: str, traffic_note: Note) -> str:
+        current = (base_intent or "").strip()
+        variant_label = self._traffic_variant_label(traffic_note)
+        if not current:
+            return variant_label
+        if not variant_label:
+            return current
+        if variant_label.lower() in current.lower():
+            return current
+        return f"{current}; covers variant: {variant_label}"
+
+    def _traffic_variant_label(self, traffic_note: Note) -> str:
+        intent = (traffic_note.intent or "").strip()
+        if intent:
+            return intent[:220]
+        keywords = [str(x).strip() for x in traffic_note.keywords[:4] if str(x).strip()]
+        if keywords:
+            return ", ".join(keywords)
+        return "analyzed traffic variant"
 
     def _add_link(self, a_id: str, b_id: str, link_type: str, weight: float) -> None:
         a = self.graph.get(a_id)

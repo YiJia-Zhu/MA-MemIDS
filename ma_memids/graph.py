@@ -26,6 +26,35 @@ class NoteGraph:
     def count(self) -> int:
         return len(self.notes)
 
+    def rebuild_all_links(self) -> None:
+        notes = list(self.notes.values())
+        for note in notes:
+            note.links = []
+
+        for idx, note in enumerate(notes):
+            for other in notes[idx + 1 :]:
+                link_candidates = self._compute_link_candidates(note, other)
+                for ltype, weight in link_candidates:
+                    self._upsert_link(note, other.note_id, ltype, weight)
+                    self._upsert_link(other, note.note_id, ltype, weight)
+
+    def retain_note_types(self, allowed_types: Set[str]) -> bool:
+        allowed = {str(item).strip() for item in allowed_types if str(item).strip()}
+        original_ids = set(self.notes.keys())
+        self.notes = {
+            note_id: note
+            for note_id, note in self.notes.items()
+            if note.note_type in allowed
+        }
+        changed = set(self.notes.keys()) != original_ids
+        for note in self.notes.values():
+            if any(link.target_id not in self.notes for link in note.links):
+                changed = True
+                break
+        if changed:
+            self.rebuild_all_links()
+        return changed
+
     def _rebuild_links_for(self, note_id: str) -> None:
         note = self.notes[note_id]
 

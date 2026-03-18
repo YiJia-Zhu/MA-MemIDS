@@ -46,13 +46,44 @@
       </div>
       <pre id="graph-summary" class="codebox"></pre>
 
+      <div class="panel-head graph-panel-head">
+        <h3>知识图谱可视化</h3>
+        <p>按筛选渲染已有 Note 关系，点击节点可查看详情</p>
+      </div>
+      <form id="graph-viz-form" class="form-grid">
+        <label>
+          note_type
+          <select name="note_type">
+            <option value="">all</option>
+            <option value="rule">rule</option>
+          </select>
+        </label>
+        <label>
+          q（可选关键词）
+          <input type="text" name="q" placeholder="protocol / tactic / sid / intent" />
+        </label>
+        <label>
+          limit
+          <input type="number" name="limit" min="1" max="240" value="80" />
+        </label>
+        <label>
+          中心 note_id（可选）
+          <input id="graph-viz-note-id" type="text" name="note_id" placeholder="留空看筛选子图；填写后看 1-hop 邻接图" />
+        </label>
+        <button class="btn btn-ghost" type="submit">Render Graph</button>
+        <button class="btn btn-ghost" id="btn-graph-reset-focus" type="button">Clear Focus</button>
+      </form>
+      <p class="flow-note">当前图谱仅展示规则 Note；节点越大表示在当前子图里的连接越多。点击节点会同步加载右下方详情。</p>
+      <div id="graph-viz-meta" class="graph-meta">Loading graph...</div>
+      <div id="graph-viz-legend" class="graph-legend"></div>
+      <div id="graph-viz" class="graph-canvas"></div>
+
       <form id="graph-list-form" class="form-grid">
         <label>
           note_type
           <select name="note_type">
             <option value="">all</option>
             <option value="rule">rule</option>
-            <option value="traffic">traffic</option>
           </select>
         </label>
         <label>
@@ -74,7 +105,7 @@
       <form id="graph-note-form" class="form-grid">
         <label class="full">
           note_id（查看单条详情）
-          <input type="text" name="note_id" placeholder="例如 rule-xxxx / traffic-xxxx" />
+          <input type="text" name="note_id" placeholder="例如 rule-xxxx" />
         </label>
         <button class="btn btn-ghost" type="submit">Load Note Detail</button>
       </form>
@@ -131,7 +162,7 @@
         <h2>Process: 上传 PCAP 或文本</h2>
         <p>调用 <code>/api/process_async</code>，实时显示步骤并支持折叠</p>
       </div>
-      <p class="flow-note">阶段二闭环：流量 → 双路检索 → 流量 Note → Top-k 相似性计算 → 规则增修 → 全规则集沙盒对比（仅分数提升通过）→ 失败分析 → 回到双路检索。</p>
+      <p class="flow-note">阶段二闭环：流量 → 双路检索 → 临时流量 Note → Top-k 相似性计算 → 规则增修 → 全规则集沙盒对比（仅分数提升通过）→ 失败分析 → 回到双路检索。</p>
       <p class="flow-note">说明：主分析流量是“未知标签”样本。系统会先通过 LLM 做攻击/正常判别，再将该 pcap 并入对应沙盒集合；合并时会按文件哈希去重，若同文件在另一集合会覆盖迁移。若你不上传沙盒样本，将自动使用默认目录 <code>sandbox_samples/attack</code> 与 <code>sandbox_samples/benign</code>。</p>
       <form id="process-form" class="form-grid">
         <label>

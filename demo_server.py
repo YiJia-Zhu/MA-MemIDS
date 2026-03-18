@@ -406,6 +406,19 @@ def _note_preview(note: Any) -> Dict[str, Any]:
     else:
         note_raw = note.to_dict()
     content = str(note_raw.get("content") or "")
+    links_raw = note_raw.get("links") or []
+    links_preview = []
+    for raw in links_raw:
+        if not isinstance(raw, dict):
+            continue
+        links_preview.append(
+            {
+                "target_id": raw.get("target_id"),
+                "link_type": raw.get("link_type"),
+                "weight": round(float(raw.get("weight", 0.0)), 4),
+            }
+        )
+    links_preview.sort(key=lambda item: (-item["weight"], str(item["target_id"] or ""), str(item["link_type"] or "")))
     return {
         "note_id": note_raw.get("note_id"),
         "note_type": note_raw.get("note_type"),
@@ -416,8 +429,53 @@ def _note_preview(note: Any) -> Dict[str, Any]:
         "protocol": note_raw.get("protocol"),
         "keywords": (note_raw.get("keywords") or [])[:12],
         "tactics": (note_raw.get("tactics") or [])[:8],
-        "link_count": len(note_raw.get("links") or []),
+        "link_count": len(links_raw),
+        "links_preview": links_preview[:12],
         "content_preview": content[:240],
+    }
+
+
+def _note_matches_keyword(note: Any, keyword: str) -> bool:
+    if not keyword:
+        return True
+    payload = note.to_dict() if hasattr(note, "to_dict") else dict(note)
+    haystacks: List[str] = [
+        str(payload.get("note_id") or ""),
+        str(payload.get("note_type") or ""),
+        str(payload.get("intent") or ""),
+        str(payload.get("content") or ""),
+        str(payload.get("protocol") or ""),
+    ]
+    haystacks.extend(str(x) for x in (payload.get("keywords") or []))
+    haystacks.extend(str(x) for x in (payload.get("tactics") or []))
+    return keyword in "\n".join(haystacks).lower()
+
+
+def _graph_node_payload(note: Any, *, is_center: bool = False) -> Dict[str, Any]:
+    payload = note.to_dict() if hasattr(note, "to_dict") else dict(note)
+    sid = payload.get("sid")
+    note_id = str(payload.get("note_id") or "")
+    note_type = str(payload.get("note_type") or "")
+    label = f"SID {sid}" if sid is not None else note_id
+    subtitle_parts = [note_type]
+    if payload.get("protocol"):
+        subtitle_parts.append(str(payload["protocol"]))
+    return {
+        "id": note_id,
+        "label": label,
+        "subtitle": " · ".join(part for part in subtitle_parts if part),
+        "note_id": note_id,
+        "note_type": note_type,
+        "intent": str(payload.get("intent") or ""),
+        "protocol": payload.get("protocol"),
+        "sid": sid,
+        "keywords": list(payload.get("keywords") or [])[:10],
+        "tactics": list(payload.get("tactics") or [])[:8],
+        "timestamp": payload.get("timestamp"),
+        "link_count": len(payload.get("links") or []),
+        "links_preview": _note_preview(payload).get("links_preview", []),
+        "content_preview": str(payload.get("content") or "")[:180],
+        "is_center": is_center,
     }
 
 
@@ -462,7 +520,6 @@ def api_graph_summary() -> Any:
     pipeline = create_pipeline_with_trace(llm_calls)
     notes = pipeline.graph.all_notes()
     rule_notes = [n for n in notes if n.note_type == "rule"]
-    traffic_notes = [n for n in notes if n.note_type == "traffic"]
     total_links = sum(len(n.links) for n in notes)
     latest_notes = sorted(notes, key=lambda n: n.timestamp, reverse=True)[:10]
     return jsonify(
@@ -471,11 +528,146 @@ def api_graph_summary() -> Any:
             "summary": {
                 "total_notes": len(notes),
                 "rule_notes": len(rule_notes),
-                "traffic_notes": len(traffic_notes),
+                "traffic_notes": 0,
                 "total_links": total_links,
                 "state_path": str(STATE_PATH),
             },
             "latest_notes": [_note_preview(n) for n in latest_notes],
+        }
+    )
+
+
+@app.get("/api/graph/view")
+def api_graph_view() -> Any:
+    try:
+        limit = _parse_int(request.args.get("limit"), default=80, min_value=1, max_value=240)
+    except ValueError:
+        return jsonify({"ok": False, "error": "limit must be integer"}), 400
+
+    note_type = (request.args.get("note_type") or "").strip().lower()
+    if note_type not in {"", "rule"}:
+        return jsonify({"ok": False, "error": "note_type must be one of: rule"}), 400
+    keyword = (request.args.get("q") or "").strip().lower()
+    center_note_id = (request.args.get("note_id") or "").strip()
+
+    llm_calls: List[Dict[str, Any]] = []
+    pipeline = create_pipeline_with_trace(llm_calls)
+    graph = pipeline.graph
+    notes = sorted(graph.all_notes(), key=lambda n: n.timestamp, reverse=True)
+
+    def _match_type(note: Any) -> bool:
+        return note_type in {"", getattr(note, "note_type", "")}
+
+    filtered_notes = [n for n in notes if _match_type(n) and _note_matches_keyword(n, keyword)]
+
+    center_note = graph.get(center_note_id) if center_note_id else None
+    if center_note_id and center_note is None:
+        return jsonify({"ok": False, "error": f"note not found: {center_note_id}"}), 404
+
+    selected_notes: List[Any] = []
+    if center_note is not None:
+        selected_notes.append(center_note)
+        neighbor_ids = {link.target_id for link in center_note.links}
+        for other in notes:
+            if other.note_id == center_note.note_id:
+                continue
+            if any(link.target_id == center_note.note_id for link in other.links):
+                neighbor_ids.add(other.note_id)
+
+        neighbors = []
+        for nid in neighbor_ids:
+            target = graph.get(nid)
+            if target is None:
+                continue
+            if note_type and target.note_type != note_type:
+                continue
+            if keyword and not _note_matches_keyword(target, keyword):
+                continue
+            neighbors.append(target)
+        neighbors = sorted(neighbors, key=lambda n: n.timestamp, reverse=True)
+        for item in neighbors:
+            if len(selected_notes) >= limit:
+                break
+            selected_notes.append(item)
+        view_mode = "focus"
+        truncated = len(neighbors) + 1 > len(selected_notes)
+    else:
+        selected_notes = filtered_notes[:limit]
+        view_mode = "filtered"
+        truncated = len(filtered_notes) > len(selected_notes)
+
+    selected_ids = {note.note_id for note in selected_notes}
+    edge_map: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for note in selected_notes:
+        for link in note.links:
+            if link.target_id not in selected_ids:
+                continue
+            pair = tuple(sorted((note.note_id, link.target_id)))
+            entry = edge_map.get(pair)
+            if entry is None:
+                entry = {
+                    "source": pair[0],
+                    "target": pair[1],
+                    "weight": 0.0,
+                    "primary_type": "related",
+                    "link_types": set(),
+                }
+                edge_map[pair] = entry
+            entry["link_types"].add(link.link_type or "related")
+            if float(link.weight) >= float(entry["weight"]):
+                entry["weight"] = float(link.weight)
+                entry["primary_type"] = link.link_type or "related"
+
+    edges: List[Dict[str, Any]] = []
+    link_type_counts: Dict[str, int] = {}
+    degree: Dict[str, int] = {note.note_id: 0 for note in selected_notes}
+    for item in edge_map.values():
+        edge = {
+            "source": item["source"],
+            "target": item["target"],
+            "weight": round(float(item["weight"]), 4),
+            "link_type": item["primary_type"],
+            "link_types": sorted(item["link_types"]),
+        }
+        edges.append(edge)
+        link_type_counts[edge["link_type"]] = link_type_counts.get(edge["link_type"], 0) + 1
+        degree[edge["source"]] = degree.get(edge["source"], 0) + 1
+        degree[edge["target"]] = degree.get(edge["target"], 0) + 1
+    edges.sort(key=lambda item: (item["source"], item["target"], item["link_type"]))
+
+    nodes: List[Dict[str, Any]] = []
+    type_counts: Dict[str, int] = {}
+    for note in selected_notes:
+        node = _graph_node_payload(note, is_center=bool(center_note and note.note_id == center_note.note_id))
+        node["degree"] = degree.get(note.note_id, 0)
+        node["radius"] = 20 if node["is_center"] else 12 + min(8, node["degree"] * 1.4)
+        nodes.append(node)
+        ntype = note.note_type
+        type_counts[ntype] = type_counts.get(ntype, 0) + 1
+
+    return jsonify(
+        {
+            "ok": True,
+            "filters": {
+                "note_type": note_type or "all",
+                "q": keyword,
+                "note_id": center_note_id or None,
+                "limit": limit,
+            },
+            "graph": {
+                "mode": view_mode,
+                "nodes": nodes,
+                "edges": edges,
+                "stats": {
+                    "rendered_nodes": len(nodes),
+                    "rendered_edges": len(edges),
+                    "matching_notes": len(filtered_notes),
+                    "type_counts": type_counts,
+                    "link_type_counts": link_type_counts,
+                    "center_note": (_note_preview(center_note) if center_note is not None else None),
+                    "truncated": truncated,
+                },
+            },
         }
     )
 
@@ -495,7 +687,10 @@ def api_graph_notes() -> Any:
     pipeline = create_pipeline_with_trace(llm_calls)
     notes = pipeline.graph.all_notes()
 
-    if note_type in {"rule", "traffic"}:
+    if note_type not in {"", "rule"}:
+        return jsonify({"ok": False, "error": "note_type must be one of: rule"}), 400
+
+    if note_type == "rule":
         notes = [n for n in notes if n.note_type == note_type]
 
     if keyword:
