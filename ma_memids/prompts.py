@@ -17,6 +17,38 @@ NOTE_EXTRACTION_USER = """【规则/流量文本】
 }}
 """
 
+TRAFFIC_CLASSIFICATION_SYSTEM = """你是网络流量攻防分析专家。你只输出 JSON。"""
+
+TRAFFIC_CLASSIFICATION_USER = """请基于以下流量 Note 信息判断该流量是否为攻击。
+
+【流量意图】
+{intent}
+
+【关键词】
+{keywords}
+
+【ATT&CK 战术技术】
+{tactics}
+
+【关联 CVE】
+{cve_ids}
+
+【流量文本片段】
+{content}
+
+输出 JSON：
+{{
+  "is_attack": true,
+  "attack_type": "xss/sql_injection/rce/lfi/command_injection/webshell/other/benign",
+  "confidence": "high/medium/low",
+  "reason": "简洁说明判定依据"
+}}
+
+注意：
+1) 只能输出 JSON，不要输出其他文字。
+2) 如果是正常流量，is_attack=false，attack_type 填 "benign"。
+"""
+
 RULE_REPAIR_SYSTEM = """你是 Suricata 规则修复专家。只输出完整 Suricata 规则。"""
 
 RULE_REPAIR_USER = """【已有规则】
@@ -37,8 +69,11 @@ RULE_GENERATE_SYSTEM = """你是 Suricata 规则生成专家。只输出完整 S
 
 RULE_GENERATE_USER = """【攻击意图】{intent}
 【关键词】{keywords}
+【网络上下文】{network_context}
 【ATT&CK】{tactics}
 【关联CVE】{cve_ids}
+【生成约束】
+{generation_constraints}
 【参考结构】
 {reference_rules}
 

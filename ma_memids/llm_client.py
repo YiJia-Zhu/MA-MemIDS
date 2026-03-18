@@ -25,6 +25,16 @@ class NullLLMClient(BaseLLMClient):
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
         _ = temperature
         last = messages[-1]["content"] if messages else ""
+        if "\"is_attack\"" in last or "is_attack" in last:
+            return json.dumps(
+                {
+                    "is_attack": False,
+                    "attack_type": "benign",
+                    "confidence": "low",
+                    "reason": "offline null client default classification",
+                },
+                ensure_ascii=False,
+            )
         if "输出 JSON" in last or "output JSON" in last.lower():
             return json.dumps(
                 {

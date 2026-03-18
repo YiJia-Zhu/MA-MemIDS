@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .config import Thresholds
 from .models import FailureDiagnosis, SandboxResult, ValidationMetrics, ValidationResult
@@ -26,8 +26,15 @@ class SuricataValidator:
         self.validation_mode = validation_mode
 
     def validate_rule_format(self, rule: str) -> Tuple[bool, Optional[str]]:
+        return self.validate_ruleset_format([rule])
+
+    def validate_ruleset_format(self, rules: List[str]) -> Tuple[bool, Optional[str]]:
+        clean_rules = [r.strip() for r in rules if str(r).strip()]
+        if not clean_rules:
+            return True, None
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".rules", delete=False) as f:
-            f.write(rule + "\n")
+            f.write("\n".join(clean_rules) + "\n")
             rule_file = f.name
 
         try:
@@ -46,13 +53,17 @@ class SuricataValidator:
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=60,
                 )
             if proc.returncode == 0:
                 return True, None
             return False, (proc.stderr or proc.stdout or "Suricata syntax error").strip()
         except FileNotFoundError:
-            return self._basic_syntax_check(rule)
+            for rule in clean_rules:
+                ok, err = self._basic_syntax_check(rule)
+                if not ok:
+                    return False, err
+            return True, None
         except subprocess.TimeoutExpired:
             return False, "Suricata format validation timeout"
         finally:
@@ -74,21 +85,17 @@ class SuricataValidator:
         return True, None
 
     def test_rule_against_pcap(self, rule: str, pcap_path: str) -> ValidationResult:
-        ok, err = self.validate_rule_format(rule)
+        return self.test_ruleset_against_pcap([rule], pcap_path)
+
+    def test_ruleset_against_pcap(self, rules: List[str], pcap_path: str) -> ValidationResult:
+        clean_rules = [r.strip() for r in rules if str(r).strip()]
+        ok, err = self.validate_ruleset_format(clean_rules)
         if not ok:
             return ValidationResult(
                 is_valid=False,
                 format_check_passed=False,
                 alerts_triggered=False,
                 error_message=err,
-            )
-
-        if self.validation_mode == "format-only":
-            return ValidationResult(
-                is_valid=True,
-                format_check_passed=True,
-                alerts_triggered=True,
-                error_message="format-only mode",
             )
 
         if not os.path.exists(pcap_path):
@@ -99,8 +106,24 @@ class SuricataValidator:
                 error_message=f"PCAP not found: {pcap_path}",
             )
 
+        if self.validation_mode == "format-only":
+            return ValidationResult(
+                is_valid=True,
+                format_check_passed=True,
+                alerts_triggered=bool(clean_rules),
+                error_message="format-only mode",
+            )
+
+        if not clean_rules:
+            return ValidationResult(
+                is_valid=False,
+                format_check_passed=True,
+                alerts_triggered=False,
+                error_message="empty ruleset",
+            )
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".rules", delete=False) as f:
-            f.write(rule + "\n")
+            f.write("\n".join(clean_rules) + "\n")
             rule_file = f.name
 
         try:
@@ -122,7 +145,7 @@ class SuricataValidator:
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=90,
+                    timeout=180,
                 )
 
                 eve_file = os.path.join(log_dir, "eve.json")
@@ -177,21 +200,31 @@ class SandboxEvaluator:
         self.thresholds = thresholds or Thresholds()
 
     def evaluate(self, rule: str, attack_pcaps: List[str], benign_pcaps: List[str]) -> SandboxResult:
-        ok, err = self.validator.validate_rule_format(rule)
+        return self.evaluate_ruleset([rule], attack_pcaps, benign_pcaps)
+
+    def evaluate_ruleset(
+        self,
+        rules: List[str],
+        attack_pcaps: List[str],
+        benign_pcaps: List[str],
+        *,
+        pass_predicate: Optional[Callable[[ValidationMetrics], bool]] = None,
+    ) -> SandboxResult:
+        ok, err = self.validator.validate_ruleset_format(rules)
         if not ok:
             return SandboxResult(passed=False, syntax_ok=False, metrics=None, reason=err or "syntax check failed")
 
         tp = fp = tn = fn = 0
 
         for pcap in attack_pcaps:
-            res = self.validator.test_rule_against_pcap(rule, pcap)
+            res = self.validator.test_ruleset_against_pcap(rules, pcap)
             if res.alerts_triggered:
                 tp += 1
             else:
                 fn += 1
 
         for pcap in benign_pcaps:
-            res = self.validator.test_rule_against_pcap(rule, pcap)
+            res = self.validator.test_ruleset_against_pcap(rules, pcap)
             if res.alerts_triggered:
                 fp += 1
             else:
@@ -216,8 +249,12 @@ class SandboxEvaluator:
             p_fpr=p_fpr,
             score=score,
         )
-        passed = score >= self.thresholds.pass_score
-        reason = "pass" if passed else "score below threshold"
+        if pass_predicate is not None:
+            passed = bool(pass_predicate(metrics))
+            reason = "pass" if passed else "pass predicate not satisfied"
+        else:
+            passed = score >= self.thresholds.pass_score
+            reason = "pass" if passed else "score below threshold"
         return SandboxResult(passed=passed, syntax_ok=True, metrics=metrics, reason=reason)
 
     def diagnose_failure(self, metrics: Optional[ValidationMetrics]) -> FailureDiagnosis:
@@ -225,6 +262,15 @@ class SandboxEvaluator:
             return FailureDiagnosis(
                 failure_type="syntax",
                 suggestion="Fix Suricata syntax errors first, then replay validation.",
+            )
+
+        if metrics.recall <= 0.0 and metrics.fn > 0:
+            return FailureDiagnosis(
+                failure_type="coverage_gap",
+                suggestion=(
+                    "Recall is zero. Check header direction/net vars first "
+                    "($EXTERNAL_NET/$HOME_NET mismatch), then relax payload literals with generalized patterns."
+                ),
             )
 
         if metrics.fpr > 0.10:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import re
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .config import RuntimeConfig, Thresholds
 from .llm_client import BaseLLMClient
@@ -18,6 +19,13 @@ from .utils import dedupe_keep_order
 
 
 RULE_LINE_RE = re.compile(r"^(alert|drop|pass|reject)\s+", re.IGNORECASE)
+RULE_HEADER_RE = re.compile(
+    r"^(?P<action>alert|drop|pass|reject)\s+"
+    r"(?P<proto>\S+)\s+"
+    r"(?P<src_net>\S+)\s+(?P<src_port>\S+)\s+->\s+"
+    r"(?P<dst_net>\S+)\s+(?P<dst_port>\S+)\s+\(",
+    re.IGNORECASE,
+)
 
 
 class RuleGenerationEngine:
@@ -91,7 +99,7 @@ class RuleGenerationEngine:
             if rule:
                 if sid_hint:
                     rule = ensure_sid(rule, sid_hint)
-                return rule
+                return self._normalize_rule_header_by_context(rule, traffic_note)
         except Exception:
             pass
 
@@ -120,7 +128,7 @@ class RuleGenerationEngine:
             if rule:
                 if sid is not None:
                     rule = ensure_sid(rule, sid)
-                return bump_rev(rule)
+                return bump_rev(self._normalize_rule_header_by_context(rule, traffic_note))
         except Exception:
             pass
 
@@ -134,6 +142,7 @@ class RuleGenerationEngine:
 
     def _generate_rule(self, traffic_note: Note, reference_rules: Sequence[str], sid: int) -> str:
         ref_text = "\n".join(reference_rules) if reference_rules else "N/A"
+        network_context = self._network_context_from_note(traffic_note)
         messages = [
             {"role": "system", "content": RULE_GENERATE_SYSTEM},
             {
@@ -141,8 +150,10 @@ class RuleGenerationEngine:
                 "content": RULE_GENERATE_USER.format(
                     intent=traffic_note.intent,
                     keywords=traffic_note.keywords[:20],
+                    network_context=self._format_network_context(network_context),
                     tactics=traffic_note.tactics[:10],
                     cve_ids=traffic_note.external_knowledge.cve_ids[:5],
+                    generation_constraints=self._generation_constraints(network_context),
                     reference_rules=ref_text,
                 ),
             },
@@ -151,11 +162,14 @@ class RuleGenerationEngine:
             response = self.llm.chat(messages, temperature=0.4)
             rule = self._extract_rule_line(response)
             if rule:
-                return ensure_sid(rule, sid)
+                return self._normalize_rule_header_by_context(ensure_sid(rule, sid), traffic_note)
         except Exception:
             pass
 
-        return self._fallback_rule(traffic_note, sid=sid, msg_prefix="Generated")
+        return self._normalize_rule_header_by_context(
+            self._fallback_rule(traffic_note, sid=sid, msg_prefix="Generated"),
+            traffic_note,
+        )
 
     def _fallback_rule(self, traffic_note: Note, sid: int, msg_prefix: str) -> str:
         protocol = (traffic_note.protocol or "http").lower()
@@ -227,7 +241,19 @@ class RuleGenerationEngine:
             low = tok.lower()
             if low in {"http", "https", "host", "user-agent", "tcp", "udp", "pcap", "protocol"}:
                 return True
-            return low.startswith(("/mnt/", "/tmp/", "pcap=", "protocol=", "src=", "dst="))
+            if low.startswith(("/mnt/", "/tmp/", "pcap=", "protocol=", "src=", "dst=")):
+                return True
+            return low.startswith(
+                (
+                    "src_ip=",
+                    "dst_ip=",
+                    "src_port=",
+                    "dst_port=",
+                    "src_zone=",
+                    "dst_zone=",
+                    "direction_hint=",
+                )
+            )
 
         signal_patterns = [
             r"<script", r"script>", r"alert", r"onerror", r"javascript",
@@ -259,3 +285,98 @@ class RuleGenerationEngine:
         if not traffic_note.keywords:
             return 0.0
         return len(common) / max(len(set(traffic_note.keywords)), 1)
+
+    def _network_context_from_note(self, note: Note) -> Dict[str, Any]:
+        meta = note.metadata if isinstance(note.metadata, dict) else {}
+        net = meta.get("network_context")
+        context: Dict[str, Any] = dict(net) if isinstance(net, dict) else {}
+
+        context.setdefault("protocol", (note.protocol or "").upper() or None)
+        for key in ("src_ip", "dst_ip", "src_port", "dst_port"):
+            if context.get(key) in (None, "") and meta.get(key) not in (None, ""):
+                context[key] = meta.get(key)
+
+        if context.get("src_zone") in (None, "") and context.get("src_ip"):
+            context["src_zone"] = self._ip_zone(str(context["src_ip"]))
+        if context.get("dst_zone") in (None, "") and context.get("dst_ip"):
+            context["dst_zone"] = self._ip_zone(str(context["dst_ip"]))
+        if context.get("direction_hint") in (None, "") and context.get("src_zone") and context.get("dst_zone"):
+            context["direction_hint"] = f"{context['src_zone']}_to_{context['dst_zone']}"
+        return context
+
+    def _ip_zone(self, ip_value: str) -> str:
+        try:
+            ip_obj = ipaddress.ip_address(ip_value)
+        except ValueError:
+            return "unknown"
+        if ip_obj.is_private:
+            return "private"
+        if ip_obj.is_loopback:
+            return "loopback"
+        if ip_obj.is_link_local:
+            return "link_local"
+        return "public"
+
+    def _format_network_context(self, context: Dict[str, Any]) -> str:
+        if not context:
+            return "N/A"
+        fields = [
+            ("protocol", context.get("protocol")),
+            ("src_ip", context.get("src_ip")),
+            ("src_zone", context.get("src_zone")),
+            ("src_port", context.get("src_port")),
+            ("dst_ip", context.get("dst_ip")),
+            ("dst_zone", context.get("dst_zone")),
+            ("dst_port", context.get("dst_port")),
+            ("direction_hint", context.get("direction_hint")),
+        ]
+        lines = [f"{k}={v}" for k, v in fields if v not in (None, "")]
+        return "\n".join(lines) if lines else "N/A"
+
+    def _generation_constraints(self, context: Dict[str, Any]) -> str:
+        lines = [
+            "1) 不确定源网段归属时，不要把源固定为 $EXTERNAL_NET，优先使用 any 作为源网段。",
+            "2) 仅当确认 src 不属于 HOME_NET 时，才使用 $EXTERNAL_NET -> $HOME_NET。",
+            "3) HTTP 攻击优先使用 to_server 方向；必要时使用 any any -> $HOME_NET any 以避免方向误判。",
+            "4) 保持检测原语聚焦 payload/URI，不要把 IP 字段写进 content 匹配。",
+        ]
+        src_zone = str(context.get("src_zone") or "")
+        dst_zone = str(context.get("dst_zone") or "")
+        if src_zone == "private" and dst_zone == "private":
+            lines.append("5) 当前样本为 private_to_private，禁止把源写成 $EXTERNAL_NET。")
+        elif src_zone == "private":
+            lines.append("5) 当前样本源为私网，源网段应为 any 或 $HOME_NET。")
+        elif src_zone == "public" and dst_zone == "private":
+            lines.append("5) 当前样本为 public_to_private，可考虑使用 $EXTERNAL_NET -> $HOME_NET。")
+        return "\n".join(lines)
+
+    def _normalize_rule_header_by_context(self, rule: str, traffic_note: Note) -> str:
+        context = self._network_context_from_note(traffic_note)
+        src_zone = str(context.get("src_zone") or "")
+        dst_zone = str(context.get("dst_zone") or "")
+        match = RULE_HEADER_RE.match(rule.strip())
+        if not match:
+            return rule
+
+        action = match.group("action")
+        proto = match.group("proto")
+        src_net = match.group("src_net")
+        src_port = match.group("src_port")
+        dst_net = match.group("dst_net")
+        dst_port = match.group("dst_port")
+        changed = False
+
+        if src_zone == "private" and src_net.upper() == "$EXTERNAL_NET":
+            src_net = "any"
+            changed = True
+
+        if dst_zone == "private" and dst_net.lower() == "any" and proto.lower() in {"http", "tcp"}:
+            dst_net = "$HOME_NET"
+            changed = True
+
+        if not changed:
+            return rule
+
+        old_header = match.group(0)
+        new_header = f"{action} {proto} {src_net} {src_port} -> {dst_net} {dst_port} ("
+        return rule.replace(old_header, new_header, 1)

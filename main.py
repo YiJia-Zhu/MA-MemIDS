@@ -30,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_cmd = sub.add_parser("init", help="Stage-1 initialization from base rules")
-    init_cmd.add_argument("--rules", required=True, help="Base Suricata rules file")
+    init_cmd.add_argument("--rules", required=True, help="Base Suricata rules file or directory")
+    init_cmd.add_argument("--max-rules", type=int, default=0, help="Optional cap for initialized rules (0 = no limit)")
 
     process_cmd = sub.add_parser("process", help="Stage-2 process unmatched traffic")
     process_cmd.add_argument("--pcap", default="", help="Unmatched traffic PCAP path")
@@ -68,7 +69,8 @@ def main() -> None:
     )
 
     if args.command == "init":
-        count = pipeline.initialize_from_rules_file(args.rules)
+        max_rules = args.max_rules if args.max_rules > 0 else None
+        count = pipeline.initialize_from_rules_file(args.rules, max_rules=max_rules)
         print(f"Initialized {count} rule notes")
         return
 

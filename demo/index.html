@@ -37,8 +37,63 @@
 
     <section class="panel reveal">
       <div class="panel-head">
+        <h2>Note 图谱管理</h2>
+        <p>查看/检索已有 Note 图谱，并可清空（危险操作）</p>
+      </div>
+
+      <div class="fold-tools">
+        <button class="btn btn-ghost" id="btn-graph-summary" type="button">Refresh Summary</button>
+      </div>
+      <pre id="graph-summary" class="codebox"></pre>
+
+      <form id="graph-list-form" class="form-grid">
+        <label>
+          note_type
+          <select name="note_type">
+            <option value="">all</option>
+            <option value="rule">rule</option>
+            <option value="traffic">traffic</option>
+          </select>
+        </label>
+        <label>
+          q（可选关键词）
+          <input type="text" name="q" placeholder="note_id / intent / content 关键词" />
+        </label>
+        <label>
+          limit
+          <input type="number" name="limit" min="1" max="500" value="50" />
+        </label>
+        <label>
+          offset
+          <input type="number" name="offset" min="0" value="0" />
+        </label>
+        <button class="btn btn-ghost" type="submit">Load Notes</button>
+      </form>
+      <pre id="graph-list" class="codebox"></pre>
+
+      <form id="graph-note-form" class="form-grid">
+        <label class="full">
+          note_id（查看单条详情）
+          <input type="text" name="note_id" placeholder="例如 rule-xxxx / traffic-xxxx" />
+        </label>
+        <button class="btn btn-ghost" type="submit">Load Note Detail</button>
+      </form>
+      <pre id="graph-note-detail" class="codebox"></pre>
+
+      <form id="graph-clear-form" class="form-grid">
+        <label class="full">
+          清空确认（输入 CLEAR）
+          <input type="text" name="confirm" placeholder="CLEAR" />
+        </label>
+        <button class="btn danger" type="submit">Clear Graph</button>
+      </form>
+      <pre id="graph-clear-result" class="codebox"></pre>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
         <h2>Init: 上传初始规则</h2>
-        <p>调用 <code>/api/init</code>，执行 pipeline.initialize_from_rules_file</p>
+        <p>调用 <code>/api/init_async</code>，异步显示初始化全过程</p>
       </div>
       <form id="init-form" class="form-grid">
         <label>
@@ -46,35 +101,54 @@
           <input type="text" name="model" placeholder="例如 deepseek-chat / gpt-4.1" />
         </label>
         <label>
-          规则文件（.rules/.txt）
-          <input type="file" name="rules_file" required />
+          规则文件（可选，.rules/.txt）
+          <input type="file" name="rules_file" />
         </label>
-        <button class="btn" type="submit">Run Init</button>
+        <label class="full">
+          默认规则路径（未上传文件时生效，可填目录）
+          <input type="text" name="default_rules_path" value="/mnt/8T/xgr/zhuyijia/MA_MemIDS/rules" />
+        </label>
+        <label>
+          max_rules（可选，0/空=不限制）
+          <input type="number" name="max_rules" min="0" value="200" />
+        </label>
+        <button class="btn" id="init-submit" type="submit">Run Init</button>
       </form>
-      <pre id="init-output" class="codebox"></pre>
+
+      <details class="fold-block" open>
+        <summary>Init Live Progress</summary>
+        <p id="init-live-status" class="live-status">Idle</p>
+        <div id="init-live" class="event-list"></div>
+      </details>
+      <details class="fold-block" open>
+        <summary>Init Response</summary>
+        <pre id="init-output" class="codebox"></pre>
+      </details>
     </section>
 
     <section class="panel reveal">
       <div class="panel-head">
         <h2>Process: 上传 PCAP 或文本</h2>
-        <p>调用 <code>/api/process</code>，返回结果 + 每步 trace + LLM 调用</p>
+        <p>调用 <code>/api/process_async</code>，实时显示步骤并支持折叠</p>
       </div>
+      <p class="flow-note">阶段二闭环：流量 → 双路检索 → 流量 Note → Top-k 相似性计算 → 规则增修 → 全规则集沙盒对比（仅分数提升通过）→ 失败分析 → 回到双路检索。</p>
+      <p class="flow-note">说明：主分析流量是“未知标签”样本。系统会先通过 LLM 做攻击/正常判别，再将该 pcap 并入对应沙盒集合；合并时会按文件哈希去重，若同文件在另一集合会覆盖迁移。若你不上传沙盒样本，将自动使用默认目录 <code>sandbox_samples/attack</code> 与 <code>sandbox_samples/benign</code>。</p>
       <form id="process-form" class="form-grid">
         <label>
           模型（可选）
           <input type="text" name="model" placeholder="例如 deepseek-chat / gpt-4.1" />
         </label>
         <label>
-          pcap 文件（可选）
+          主分析流量 pcap（未知是否攻击，可选；留空则用下方 traffic_text）
           <input type="file" name="pcap_file" accept=".pcap,.pcapng,.cap" />
         </label>
         <label>
-          攻击流量 pcap（可选，默认用 pcap_file）
-          <input type="file" name="attack_pcap" accept=".pcap,.pcapng,.cap" />
+          沙盒攻击样本集 pcap（可选，可多选；为空默认 `sandbox_samples/attack`，若无样本再回退主分析流量）
+          <input type="file" name="attack_pcap" accept=".pcap,.pcapng,.cap" multiple />
         </label>
         <label>
-          正常流量 pcap（可选）
-          <input type="file" name="benign_pcap" accept=".pcap,.pcapng,.cap" />
+          沙盒正常样本集 pcap（可选，可多选；为空默认 `sandbox_samples/benign`）
+          <input type="file" name="benign_pcap" accept=".pcap,.pcapng,.cap" multiple />
         </label>
         <label class="full">
           traffic_text（当不上传 pcap 时可直接贴）
@@ -92,22 +166,34 @@
           override keywords（可选，逗号分隔）
           <input type="text" name="override_keywords" placeholder="<script>,alert,xss" />
         </label>
-        <button class="btn" type="submit">Run Process</button>
+        <button class="btn" id="process-submit" type="submit">Run Process</button>
       </form>
 
-      <div class="result-grid">
-        <article>
-          <h3>Final Result</h3>
-          <pre id="process-result" class="codebox"></pre>
-        </article>
-        <article>
-          <h3>Step Trace</h3>
-          <pre id="process-trace" class="codebox"></pre>
-        </article>
+      <div class="fold-tools">
+        <button type="button" class="btn btn-ghost" id="btn-expand-all">Expand All</button>
+        <button type="button" class="btn btn-ghost" id="btn-collapse-all">Collapse All</button>
       </div>
 
-      <h3>LLM Calls (prompt / response)</h3>
-      <pre id="llm-calls" class="codebox"></pre>
+      <details class="fold-block" open>
+        <summary>Process Live Progress</summary>
+        <p id="process-live-status" class="live-status">Idle</p>
+        <div id="process-live" class="event-list"></div>
+      </details>
+
+      <details class="fold-block" open>
+        <summary>Final Result</summary>
+        <pre id="process-result" class="codebox"></pre>
+      </details>
+
+      <details class="fold-block">
+        <summary>Step Trace</summary>
+        <pre id="process-trace" class="codebox"></pre>
+      </details>
+
+      <details class="fold-block">
+        <summary>LLM Calls (prompt / response)</summary>
+        <pre id="llm-calls" class="codebox"></pre>
+      </details>
     </section>
   </main>
 

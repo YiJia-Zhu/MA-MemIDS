@@ -1,0 +1,15 @@
+{
+  "benign": {
+    "benign_home": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/benign/benign_home.pcap",
+    "benign_search": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/benign/benign_search.pcap",
+    "benign_login": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/benign/benign_login.pcap",
+    "benign_api": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/benign/benign_api.pcap"
+  },
+  "attack": {
+    "attack_sqli_union": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/attack/attack_sqli_union.pcap",
+    "attack_sqli_or_true": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/attack/attack_sqli_or_true.pcap",
+    "attack_xss_script": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/attack/attack_xss_script.pcap",
+    "attack_lfi_passwd": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/attack/attack_lfi_passwd.pcap",
+    "attack_cmd_inject": "/mnt/8T/xgr/zhuyijia/MA_MemIDS/sandbox_samples/attack/attack_cmd_inject.pcap"
+  }
+}

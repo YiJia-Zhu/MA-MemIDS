@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import uuid
@@ -68,15 +69,24 @@ class NoteBuilder:
         metadata: Optional[Dict[str, object]] = None,
         note_id: Optional[str] = None,
     ) -> Note:
+        metadata_out: Dict[str, object] = dict(metadata or {})
+        network_context = self._build_network_context(traffic_text, protocol=protocol, metadata=metadata_out)
+        if network_context:
+            metadata_out["network_context"] = network_context
+
         knowledge = self.retriever.retrieve(traffic_text)
         extraction = self._extract_semantics(
             text=traffic_text,
             knowledge=knowledge,
-            seed_keywords=self._extract_plain_keywords(traffic_text),
+            seed_keywords=self._extract_plain_keywords(traffic_text) + self._network_keywords(network_context),
             seed_tactics=knowledge.tech_ids,
         )
 
-        keywords = dedupe_keep_order(self._extract_plain_keywords(traffic_text) + extraction.keywords)
+        keywords = dedupe_keep_order(
+            self._extract_plain_keywords(traffic_text)
+            + self._network_keywords(network_context)
+            + extraction.keywords
+        )
         tactics = dedupe_keep_order(extraction.tactics + knowledge.tech_ids)
         intent = extraction.intent
 
@@ -95,7 +105,7 @@ class NoteBuilder:
             external_knowledge=knowledge,
             timestamp=now_iso(),
             protocol=(protocol or "").upper() or None,
-            metadata=metadata or {},
+            metadata=metadata_out,
         )
 
     def reembed_note(self, note: Note) -> Note:
@@ -177,6 +187,91 @@ class NoteBuilder:
             candidates.extend(self._tokenize_signal_text(ln))
 
         return dedupe_keep_order(candidates)[:30]
+
+    def _build_network_context(
+        self,
+        text: str,
+        protocol: Optional[str],
+        metadata: Dict[str, object],
+    ) -> Dict[str, object]:
+        context: Dict[str, object] = {}
+
+        def _to_int(value: object) -> Optional[int]:
+            try:
+                if value is None or value == "":
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        proto = (protocol or metadata.get("protocol") or "").strip()
+        if proto:
+            context["protocol"] = proto.upper()
+
+        src_ip = str(metadata.get("src_ip") or "").strip()
+        dst_ip = str(metadata.get("dst_ip") or "").strip()
+        src_port = _to_int(metadata.get("src_port"))
+        dst_port = _to_int(metadata.get("dst_port"))
+
+        if (not src_ip or not dst_ip) or (src_port is None or dst_port is None):
+            for ln in (text or "").splitlines():
+                line = ln.strip()
+                if not line.lower().startswith("src="):
+                    continue
+                match = re.match(
+                    r"^src=(?P<src_ip>[^:\s]+):(?P<src_port>\d+)\s+dst=(?P<dst_ip>[^:\s]+):(?P<dst_port>\d+)\s*$",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                if not match:
+                    continue
+                src_ip = src_ip or match.group("src_ip")
+                dst_ip = dst_ip or match.group("dst_ip")
+                if src_port is None:
+                    src_port = _to_int(match.group("src_port"))
+                if dst_port is None:
+                    dst_port = _to_int(match.group("dst_port"))
+                break
+
+        if src_ip:
+            context["src_ip"] = src_ip
+            context["src_zone"] = self._ip_zone(src_ip)
+        if dst_ip:
+            context["dst_ip"] = dst_ip
+            context["dst_zone"] = self._ip_zone(dst_ip)
+        if src_port is not None:
+            context["src_port"] = src_port
+        if dst_port is not None:
+            context["dst_port"] = dst_port
+
+        if "src_zone" in context and "dst_zone" in context:
+            context["direction_hint"] = f"{context['src_zone']}_to_{context['dst_zone']}"
+
+        return context
+
+    def _ip_zone(self, value: str) -> str:
+        try:
+            ip_obj = ipaddress.ip_address(value)
+        except ValueError:
+            return "unknown"
+        if ip_obj.is_private:
+            return "private"
+        if ip_obj.is_loopback:
+            return "loopback"
+        if ip_obj.is_link_local:
+            return "link_local"
+        return "public"
+
+    def _network_keywords(self, network_context: Dict[str, object]) -> List[str]:
+        if not network_context:
+            return []
+        tokens: List[str] = []
+        for key in ("protocol", "src_ip", "dst_ip", "src_port", "dst_port", "src_zone", "dst_zone", "direction_hint"):
+            value = network_context.get(key)
+            if value is None or value == "":
+                continue
+            tokens.append(f"{key}={value}")
+        return tokens
 
     def _tokenize_signal_text(self, text: str) -> List[str]:
         raw = re.findall(r"[A-Za-z0-9_./<>=:%'\"-]{3,}", text)
