@@ -9,7 +9,6 @@ const GRAPH_NODE_COLORS = {
 };
 
 const GRAPH_EDGE_COLORS = {
-  protocol_family: '#0f766e',
   tactic_group: '#2563eb',
   semantic_similar: '#ca8a04',
   subsume: '#7c3aed',

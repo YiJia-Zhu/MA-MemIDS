@@ -41,18 +41,22 @@ class NoteGraph:
     def retain_note_types(self, allowed_types: Set[str]) -> bool:
         allowed = {str(item).strip() for item in allowed_types if str(item).strip()}
         original_ids = set(self.notes.keys())
+        before_links = {
+            note_id: sorted((link.target_id, link.link_type, round(float(link.weight), 8)) for link in note.links)
+            for note_id, note in self.notes.items()
+            if note.note_type in allowed
+        }
         self.notes = {
             note_id: note
             for note_id, note in self.notes.items()
             if note.note_type in allowed
         }
-        changed = set(self.notes.keys()) != original_ids
-        for note in self.notes.values():
-            if any(link.target_id not in self.notes for link in note.links):
-                changed = True
-                break
-        if changed:
-            self.rebuild_all_links()
+        self.rebuild_all_links()
+        after_links = {
+            note_id: sorted((link.target_id, link.link_type, round(float(link.weight), 8)) for link in note.links)
+            for note_id, note in self.notes.items()
+        }
+        changed = set(self.notes.keys()) != original_ids or before_links != after_links
         return changed
 
     def _rebuild_links_for(self, note_id: str) -> None:
@@ -82,9 +86,6 @@ class NoteGraph:
         cve_b = set(b.external_knowledge.cve_ids)
         if cve_a & cve_b:
             out.append(("exploit_chain", 1.0))
-
-        if a.protocol and b.protocol and a.protocol == b.protocol:
-            out.append(("protocol_family", 0.8))
 
         if set_subset(a.keywords, b.keywords) or set_subset(b.keywords, a.keywords):
             out.append(("subsume", 0.9))
