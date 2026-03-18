@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
+import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -11,8 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
 
 from ma_memids.llm_client import BaseLLMClient, create_llm_client
 from ma_memids.pipeline import MAMemIDSPipeline
@@ -21,6 +29,7 @@ from ma_memids.pipeline import MAMemIDSPipeline
 ROOT = Path(__file__).resolve().parent
 DEMO_DIR = ROOT / "demo"
 STATE_PATH = ROOT / "memory" / "state.json"
+LOG_PATH = ROOT / "memory" / "demo_server.log"
 DEFAULT_RULES_PATH = ROOT / "rules"
 DEFAULT_SANDBOX_ROOT = ROOT / "sandbox_samples"
 DEFAULT_ATTACK_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "attack"
@@ -32,7 +41,58 @@ MAX_JOBS = 120
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
-load_dotenv()
+
+def _configure_logging() -> logging.Logger:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("ma_memids.demo_server")
+    if logger.handlers:
+        return logger
+
+    level_name = (os.getenv("MA_MEMIDS_DEMO_LOG_LEVEL") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.propagate = False
+    return logger
+
+
+LOGGER = _configure_logging()
+DOTENV_LOADED = load_dotenv()
+LOGGER.info(
+    "demo_server bootstrap: cwd=%s python=%s argv=%s dotenv_loaded=%s log_path=%s",
+    os.getcwd(),
+    sys.executable,
+    sys.argv,
+    DOTENV_LOADED,
+    LOG_PATH,
+)
+
+
+def _log_process_exit() -> None:
+    LOGGER.info("demo_server process exiting")
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        LOGGER.info("demo_server interrupted by KeyboardInterrupt")
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical("demo_server uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+atexit.register(_log_process_exit)
+sys.excepthook = _log_uncaught_exception
 
 
 class TracingLLMClient(BaseLLMClient):
@@ -78,6 +138,21 @@ def _cleanup_files(paths: List[str]) -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def _resolve_app_path(path_value: str) -> Path:
+    candidate = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    return candidate.resolve(strict=False)
+
+
+def _display_app_path(path_value: str | Path) -> str:
+    candidate = _resolve_app_path(str(path_value))
+    try:
+        return candidate.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(candidate)
 
 
 def _collect_pcap_files(path_str: str) -> List[str]:
@@ -228,11 +303,14 @@ def _resolve_init_request() -> Dict[str, Any]:
         rules_path = tmp_path
     else:
         default_rules_path = (request.form.get("default_rules_path") or "").strip()
-        rules_path = default_rules_path or os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH))
+        resolved_rules_path = _resolve_app_path(
+            default_rules_path or os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH))
+        )
+        rules_path = str(resolved_rules_path)
         source = "default_path"
-        source_label = rules_path
-        if not Path(rules_path).exists():
-            raise ValueError(f"default rules path not found: {rules_path}")
+        source_label = _display_app_path(resolved_rules_path)
+        if not resolved_rules_path.exists():
+            raise ValueError(f"default rules path not found: {source_label}")
 
     return {
         "rules_path": rules_path,
@@ -502,7 +580,9 @@ def api_status() -> Any:
             "ok": True,
             "stats": pipeline.stats(),
             "state_path": str(STATE_PATH),
-            "default_rules_path": os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH)),
+            "default_rules_path": _display_app_path(
+                os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH))
+            ),
             "running_jobs": running_jobs,
             "default_sandbox": {
                 "attack_dir": default_attack_dir,
@@ -906,4 +986,13 @@ def api_job(job_id: str) -> Any:
 if __name__ == "__main__":
     host = os.getenv("MA_MEMIDS_DEMO_HOST", "127.0.0.1")
     port = int(os.getenv("MA_MEMIDS_DEMO_PORT", "8090"))
-    app.run(host=host, port=port, debug=False)
+    LOGGER.info("starting flask dev server host=%s port=%s", host, port)
+    try:
+        app.run(host=host, port=port, debug=False)
+        LOGGER.warning("flask app.run returned unexpectedly")
+    except SystemExit as exc:
+        LOGGER.error("demo_server SystemExit code=%s", exc.code, exc_info=True)
+        raise
+    except BaseException:
+        LOGGER.exception("demo_server fatal error during app.run")
+        raise

@@ -79,9 +79,10 @@ class MAMemIDSPipeline:
             raise ValueError("max_rules must be a positive integer")
 
         count = 0
+        new_notes: List[Note] = []
         for rule in self._iter_rules_from_path(path):
             note = self.note_builder.build_rule_note(rule)
-            self.graph.add_or_update(note)
+            new_notes.append(note)
             count += 1
             if progress_callback and (count == 1 or count % 25 == 0):
                 progress_callback(
@@ -95,6 +96,7 @@ class MAMemIDSPipeline:
             if max_rules is not None and count >= max_rules:
                 break
 
+        self.graph.add_or_update_many(new_notes)
         self.save_state()
         if progress_callback:
             progress_callback(
@@ -311,6 +313,7 @@ class MAMemIDSPipeline:
             proposal_local = self.rule_engine.propose_rule(
                 traffic_note=traffic_note_local,
                 candidate_notes=candidate_notes_local,
+                candidate_scores=ranked_local,
                 all_rule_notes=self._rule_notes(),
             )
             _record_step(
@@ -591,6 +594,7 @@ class MAMemIDSPipeline:
             "traffic_notes": 0,
             "llm_model": self.llm.model_name(),
             "thresholds": self.thresholds.__dict__,
+            "graph_index": self.graph.index_stats(),
             "sandbox_baseline": {
                 "cached": bool(self.sandbox_baseline),
                 "score": baseline_score,
@@ -612,6 +616,11 @@ class MAMemIDSPipeline:
         graph_data = raw.get("graph") if isinstance(raw, dict) else {}
         if isinstance(graph_data, dict):
             self.graph = NoteGraph.from_dict(graph_data)
+            self.weights = self.graph.weights
+            self.thresholds = self.graph.thresholds
+            self.sandbox = SandboxEvaluator(self.validator, thresholds=self.thresholds)
+            self.rule_engine = RuleGenerationEngine(self.llm, thresholds=self.thresholds, runtime=self.runtime)
+            self.graph.rebuild_all_links()
         baseline_data = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
         if isinstance(baseline_data, dict):
             self.sandbox_baseline = baseline_data

@@ -1,0 +1,10 @@
+2026-03-19 00:55:36,202 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=C:\Users\CodexSandboxOffline\.codex\.sandbox\cwd\2c9f5b91d3e090dd python=D:\conda\python.exe argv=['.\\demo_server.py'] dotenv_loaded=False log_path=D:\ai_models\MA-MemIDS\memory\demo_server.log
+2026-03-19 00:55:36,208 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 00:56:04,250 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=D:\ai_models\MA-MemIDS python=D:\conda\python.exe argv=['.\\demo_server.py'] dotenv_loaded=False log_path=D:\ai_models\MA-MemIDS\memory\demo_server.log
+2026-03-19 00:56:04,256 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 00:56:08,839 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-03-19 00:56:08,840 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 00:57:31,394 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=D:\ai_models\MA-MemIDS python=D:\ai_models\conda_env\agent\python.exe argv=['.\\demo_server.py'] dotenv_loaded=True log_path=D:\ai_models\MA-MemIDS\memory\demo_server.log
+2026-03-19 00:57:31,402 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 00:57:33,478 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-03-19 00:57:33,478 | INFO | ma_memids.demo_server | demo_server process exiting

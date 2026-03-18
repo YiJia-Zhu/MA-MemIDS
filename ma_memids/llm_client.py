@@ -6,7 +6,12 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
 import httpx
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 
 class BaseLLMClient(ABC):

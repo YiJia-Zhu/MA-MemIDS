@@ -25,7 +25,12 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from ma_memids.embedding import HashingEmbedder
 from ma_memids.graph import NoteGraph

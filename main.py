@@ -7,7 +7,11 @@ import logging
 from pathlib import Path
 from typing import List
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 from ma_memids.pipeline import MAMemIDSPipeline
 

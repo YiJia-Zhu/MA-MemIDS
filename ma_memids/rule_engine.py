@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .config import RuntimeConfig, Thresholds
 from .llm_client import BaseLLMClient
-from .models import FailureDiagnosis, Note, RuleProposal
+from .models import FailureDiagnosis, Note, RuleProposal, SimilarityResult
 from .prompts import (
     FAILURE_ANALYSIS_USER,
     RULE_GENERATE_SYSTEM,
@@ -50,11 +50,15 @@ class RuleGenerationEngine:
         self,
         traffic_note: Note,
         candidate_notes: Sequence[Note],
+        candidate_scores: Optional[Sequence[SimilarityResult]],
         all_rule_notes: Iterable[Note],
     ) -> RuleProposal:
         if candidate_notes:
             base_note = candidate_notes[0]
-            max_similarity = max(0.0, min(1.0, self._similarity_hint(traffic_note, base_note)))
+            max_similarity = self._top_similarity_score(candidate_scores, base_note.note_id)
+            if max_similarity is None:
+                max_similarity = self._similarity_hint(traffic_note, base_note)
+            max_similarity = max(0.0, min(1.0, max_similarity))
         else:
             base_note = None
             max_similarity = 0.0
@@ -285,6 +289,18 @@ class RuleGenerationEngine:
         if not traffic_note.keywords:
             return 0.0
         return len(common) / max(len(set(traffic_note.keywords)), 1)
+
+    def _top_similarity_score(
+        self,
+        candidate_scores: Optional[Sequence[SimilarityResult]],
+        note_id: str,
+    ) -> Optional[float]:
+        if not candidate_scores:
+            return None
+        for item in candidate_scores:
+            if item.note_id == note_id:
+                return float(item.score)
+        return None
 
     def _network_context_from_note(self, note: Note) -> Dict[str, Any]:
         meta = note.metadata if isinstance(note.metadata, dict) else {}

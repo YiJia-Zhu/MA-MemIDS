@@ -15,6 +15,8 @@
 cd /mnt/8T/xgr/zhuyijia/MA_MemIDS
 pip install -r requirements.txt
 
+# `hnswlib` 是可选加速依赖；默认不会启用。只有设置 `MA_MEMIDS_ENABLE_HNSW=1` 时才会尝试加载，否则始终使用精确余弦扫描
+
 # 查看状态
 python main.py stats
 
@@ -60,7 +62,7 @@ MA_MemIDS/
     ├── rule_parser.py           # Suricata 规则字段解析（sid/rev/protocol/content...）
     ├── pcap_parser.py           # PCAP -> 结构化文本摘要（scapy/tshark）
     ├── note_builder.py          # 规则Note/流量Note同构构建 + 重嵌入
-    ├── graph.py                 # 邻接图构建、w_ij、Top-k检索、冗余合并候选
+    ├── graph.py                 # 邻接图构建、统一相似度、ANN候选召回、Top-k检索、冗余合并候选
     ├── validation.py            # Suricata语法/回放验证 + F2*P_fpr + 失败诊断
     ├── rule_engine.py           # 修复/参考生成/从头生成 + 失败重生成
     └── pipeline.py              # 总编排：初始化、在线处理、固化、导出、统计
@@ -154,7 +156,7 @@ python main.py \
 
 ### 5.3 Embedding 模型
 
-当前实现不需要下载外部 embedding 模型，`embedding.py` 使用本地哈希向量方案。
+当前实现不需要下载外部 embedding 模型，`embedding.py` 使用本地哈希向量方案；`hnswlib` 只是可选加速项，并且默认关闭。只有设置环境变量 `MA_MEMIDS_ENABLE_HNSW=1` 时，才会尝试在该向量空间上构建 HNSW 索引做候选召回，否则始终使用精确扫描。
 
 ---
 
