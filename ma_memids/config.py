@@ -33,5 +33,9 @@ class Thresholds:
 @dataclass(frozen=True)
 class RuntimeConfig:
     sid_start: int = 1_200_000
-    embedding_dim: int = 256
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_dim: int = 384
     knowledge_top_k: int = 5
+    knowledge_sparse_k: int = 5
+    knowledge_dense_k: int = 5
+    knowledge_rrf_k: int = 60

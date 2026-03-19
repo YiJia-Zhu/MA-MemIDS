@@ -25,9 +25,9 @@ def _split_csv(value: str) -> List[str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MA-MemIDS CLI")
     parser.add_argument("--state", default="./memory/state.json", help="State JSON path")
-    parser.add_argument("--cve-kb", default="", help="CVE knowledge JSON/JSONL path")
-    parser.add_argument("--attack-kb", default="", help="ATT&CK knowledge JSON/JSONL path")
-    parser.add_argument("--cti-kb", default="", help="CTI knowledge JSON/JSONL path")
+    parser.add_argument("--cve-kb", default="", help="CVE knowledge file or directory path")
+    parser.add_argument("--attack-kb", default="", help="ATT&CK knowledge file or directory path")
+    parser.add_argument("--cti-kb", default="", help="CTI knowledge file or directory path")
     parser.add_argument("--model", default=None, help="LLM model name from env configuration")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
 

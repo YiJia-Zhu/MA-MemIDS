@@ -253,7 +253,7 @@ For each pair (m_i, m_j), i < j:
 Build optional HNSW Index（fallback: exact cosine scan）on {e_i}
 ```
 
-**当前工程实现说明**：代码已切换为“候选召回 + 统一精排打分”。召回层支持 `HNSW` 搜索 embedding 近邻，并与 `SameCVE / KeywordOverlap` 结构化候选并集；但 `HNSW` 默认关闭，只有设置环境变量 `MA_MEMIDS_ENABLE_HNSW=1` 时才会尝试加载 `hnswlib`。未启用或加载失败时，自动回退为精确余弦扫描。最终建边时不再使用“同协议固定权重”或 `cos >= 0.75` 的硬门槛，而是统一使用融合分数，并保留 `exploit_chain / subsume / tactic_group / semantic_similar` 作为关系标签。
+**当前工程实现说明**：代码已切换为“候选召回 + 统一精排打分”。embedding 默认使用 `sentence-transformers/all-MiniLM-L6-v2`（`384` 维），首次运行会自动下载并缓存。知识召回层现为统一的 Hybrid Retrieval：先将 ATT&CK STIX 与 CVE 官方 JSON 预处理成标准文档，再分别执行 Sparse Retrieval（SQLite FTS5 / BM25）和 Dense Retrieval（embedding 近邻），最后使用 `RRF(k=60)` 融合两路前 `top5` 候选。若环境中可用 `hnswlib`，知识库 Dense 检索会自动加载预构建 HNSW；否则回退为精确 Dense 扫描。最终建边时不再使用“同协议固定权重”或 `cos >= 0.75` 的硬门槛，而是统一使用融合分数，并保留 `exploit_chain / subsume / tactic_group / semantic_similar` 作为关系标签。
 
 ---
 

@@ -2,8 +2,8 @@
 
 基于你的 `MA_MemIDS.md` 落地的可运行工程版，核心实现了：
 
-- 阶段一初始化：规则 -> 双路知识检索 -> Note 构建 -> 邻接图
-- 阶段二在线：流量 -> 现有规则预检（若已命中则提前结束）-> 双路知识检索 -> 流量 Note -> Note 相似性 Top-k -> 规则增修 -> 沙盒验证 -> 失败分析 -> 回到双路知识检索
+- 阶段一初始化：规则 -> 混合知识检索（Sparse BM25 + Dense + RRF）-> Note 构建 -> 邻接图
+- 阶段二在线：流量 -> 现有规则预检（若已命中则提前结束）-> 混合知识检索 -> 流量 Note -> Note 相似性 Top-k -> 规则增修 -> 沙盒验证 -> 失败分析 -> 回到混合知识检索
 - 沙盒评分：`Score = F2 * P_fpr`，并采用“全规则集前后对比”准入（仅 `Score_new > Score_base` 通过）
 - 记忆固化与演化：写回、级联、冗余检查
 
@@ -15,7 +15,9 @@
 cd /mnt/8T/xgr/zhuyijia/MA_MemIDS
 pip install -r requirements.txt
 
-# `hnswlib` 是可选加速依赖；默认不会启用。只有设置 `MA_MEMIDS_ENABLE_HNSW=1` 时才会尝试加载，否则始终使用精确余弦扫描
+# `hnswlib` 对图谱候选召回仍是可选加速依赖；只有设置 `MA_MEMIDS_ENABLE_HNSW=1` 时图谱层才会启用
+# 知识检索层若检测到 `hnswlib` 可用，会在预构建阶段自动为知识库生成 HNSW 缓存，否则回退为精确 Dense 扫描
+# embedding 默认使用 `sentence-transformers/all-MiniLM-L6-v2`，首次运行会自动下载模型
 
 # 查看状态
 python main.py stats
@@ -45,7 +47,8 @@ MA_MemIDS/
 ├── requirements.txt             # 依赖
 ├── scripts/
 │   ├── run_xss_from_gridai.sh   # 直接跑 GRIDAI 的 xss_sample.pcap
-│   └── generate_sandbox_pcaps.py# 生成沙盒验证用 benign/attack pcap
+│   ├── generate_sandbox_pcaps.py# 生成沙盒验证用 benign/attack pcap
+│   └── build_knowledge_index.py # 预构建知识检索缓存（Sparse/Dense）
 ├── demo/                        # 项目演示网页（交互式）
 │   ├── index.html
 │   ├── styles.css
@@ -55,8 +58,8 @@ MA_MemIDS/
     ├── config.py                # 超参数、阈值、运行默认配置
     ├── models.py                # 数据结构：Note/Link/ValidationResult/ProcessResult...
     ├── utils.py                 # 通用函数：tokenize/jaccard/cosine/time
-    ├── embedding.py             # 全信息 embedding（当前为无外部模型哈希向量）
-    ├── knowledge.py             # 双路知识检索：关键词+语义，结果融合
+    ├── embedding.py             # 全信息 embedding（Sentence-Transformers / all-MiniLM-L6-v2）
+    ├── knowledge.py             # 混合知识检索：BM25(FTS5)+Dense+RRF，含 ATT&CK/CVE 预处理与缓存
     ├── prompts.py               # 所有 prompt 模板集中管理
     ├── llm_client.py            # API 客户端工厂（OpenAI/DeepSeek/GLM）
     ├── rule_parser.py           # Suricata 规则字段解析（sid/rev/protocol/content...）
@@ -113,8 +116,8 @@ Prompt 全在：
 主编排在 `ma_memids/pipeline.py`：
 
 - 初始化组件：retriever/embedder/LLM/graph/validator
-- 处理流量：PCAP 解析 -> 现有规则集预检（已触发则不再生成新规则）-> 双路检索 -> 流量 Note -> Note 相似性 Top-k -> 规则提案
-- 沙盒循环：先计算当前全规则集基线分数，再对“修改后全规则集”回放验证；仅当 `Score_new > Score_base` 才通过并固化（基线指标会缓存并在通过后更新）-> 失败分析（语法报错 / 召回不足 / FPR 过高）-> 回到双路检索重建 Note 与提案（最多 `max 3` 次）
+- 处理流量：PCAP 解析 -> 现有规则集预检（已触发则不再生成新规则）-> 混合检索（Sparse BM25 + Dense + RRF）-> 流量 Note -> Note 相似性 Top-k -> 规则提案
+- 沙盒循环：先计算当前全规则集基线分数，再对“修改后全规则集”回放验证；仅当 `Score_new > Score_base` 才通过并固化（基线指标会缓存并在通过后更新）-> 失败分析（语法报错 / 召回不足 / FPR 过高）-> 回到混合检索重建 Note 与提案（最多 `max 3` 次）
 - 通过后固化：更新图、写回 state、检查合并候选
 
 ---
@@ -146,17 +149,41 @@ python main.py --model gpt-4.1 stats
 
 ```bash
 python main.py \
-  --cve-kb ./knowledge/cve.json \
-  --attack-kb ./knowledge/attack.json \
-  --cti-kb ./knowledge/cti.json \
+  --cve-kb ./knowledge/cves \
+  --attack-kb ./knowledge/cti-ATT-CK-v18.1 \
+  --cti-kb ./knowledge/cti.jsonl \
   init --rules /path/to/base.rules
 ```
 
-支持 `json/jsonl`，每条至少有 `id/title/text`（可用别名字段）。
+支持以下输入：
+
+- `--attack-kb`：MITRE ATT&CK STIX 文件或目录（例如 `enterprise/mobile/ics` bundle 目录）
+- `--cve-kb`：CVE Project 官方 JSON 文件或目录（例如 `cves/` 根目录）
+- `--cti-kb`：通用 `json/jsonl` 扁平知识库
+
+运行时会自动做源数据预处理，并在 `memory/knowledge_cache` 下缓存：
+
+- 标准化文档
+- Sparse 索引：SQLite FTS5 / BM25
+- Dense 向量缓存：`all-MiniLM-L6-v2`
+- 候选融合：RRF，`k=60`
+
+ATT&CK 和 CVE 虽然原始格式不同，但进入检索层后共用同一套 `Sparse + Dense + RRF` 搜索逻辑。
+下载地址：
+ATT&CK：https://github.com/mitre/cti/releases
+CVE：https://github.com/CVEProject/cvelistV5/releases
+
+也可以提前手动预构建缓存：
+
+```bash
+python scripts/build_knowledge_index.py \
+  --attack-kb ./knowledge/cti-ATT-CK-v18.1 \
+  --cve-kb ./knowledge/cves
+```
 
 ### 5.3 Embedding 模型
 
-当前实现不需要下载外部 embedding 模型，`embedding.py` 使用本地哈希向量方案；`hnswlib` 只是可选加速项，并且默认关闭。只有设置环境变量 `MA_MEMIDS_ENABLE_HNSW=1` 时，才会尝试在该向量空间上构建 HNSW 索引做候选召回，否则始终使用精确扫描。
+当前默认 embedding 模型是 `sentence-transformers/all-MiniLM-L6-v2`，输出维度为 `384`。`SentenceTransformer` 会在首次运行时自动下载模型并缓存到本地；如需覆盖模型名，可设置环境变量 `MA_MEMIDS_EMBEDDING_MODEL`。知识检索层会离线缓存 Dense 向量；若环境中可用 `hnswlib`，还会自动为知识库构建 HNSW 索引，否则回退为精确 Dense 扫描。
 
 ---
 

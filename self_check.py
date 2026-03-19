@@ -32,7 +32,7 @@ except ImportError:
     def load_dotenv(*args, **kwargs):
         return False
 
-from ma_memids.embedding import HashingEmbedder
+from ma_memids.embedding import SentenceTransformerEmbedder
 from ma_memids.graph import NoteGraph
 from ma_memids.knowledge import DualPathRetriever
 from ma_memids.llm_client import NullLLMClient, create_llm_client
@@ -140,7 +140,7 @@ def check_network(model_arg: Optional[str], timeout: float, skip_api: bool) -> C
 
 
 def check_embedding_and_retrieval() -> CheckResult:
-    embedder = HashingEmbedder()
+    embedder = SentenceTransformerEmbedder()
     retriever = DualPathRetriever(embedder=embedder)
     q = "Exploit CVE-2024-12345 against public-facing app T1190 with SQL injection payload"
     res = retriever.retrieve(q)
@@ -149,7 +149,7 @@ def check_embedding_and_retrieval() -> CheckResult:
     return CheckResult(
         "embedding+retrieval",
         ok,
-        f"dim={len(v)}; cve_ids={res.cve_ids[:3]}; tech_ids={res.tech_ids[:3]}",
+        f"model={embedder.model_name}; dim={len(v)}; cve_ids={res.cve_ids[:3]}; tech_ids={res.tech_ids[:3]}",
     )
 
 
@@ -160,8 +160,9 @@ def check_rule_parser_and_note_builder() -> CheckResult:
         'content:"union select"; nocase; metadata:mitre_tactic T1190,cve CVE-2024-12345; sid:1234567; rev:1;)'
     )
     fields = parse_rule_fields(rule)
-    retriever = DualPathRetriever(embedder=HashingEmbedder())
-    builder = NoteBuilder(retriever=retriever, embedder=HashingEmbedder(), llm_client=NullLLMClient())
+    embedder = SentenceTransformerEmbedder()
+    retriever = DualPathRetriever(embedder=embedder)
+    builder = NoteBuilder(retriever=retriever, embedder=embedder, llm_client=NullLLMClient())
     note = builder.build_rule_note(rule)
 
     ok = (
@@ -179,9 +180,10 @@ def check_rule_parser_and_note_builder() -> CheckResult:
 
 
 def check_graph_search() -> CheckResult:
+    embedder = SentenceTransformerEmbedder()
     builder = NoteBuilder(
-        retriever=DualPathRetriever(embedder=HashingEmbedder()),
-        embedder=HashingEmbedder(),
+        retriever=DualPathRetriever(embedder=embedder),
+        embedder=embedder,
         llm_client=NullLLMClient(),
     )
     graph = NoteGraph()

@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .embedding import HashingEmbedder
+from .embedding import SentenceTransformerEmbedder
 from .knowledge import DualPathRetriever
 from .llm_client import BaseLLMClient
 from .models import EnrichedKnowledge, ExternalDoc, LLMNoteExtraction, Note, RetrievedItem
@@ -19,7 +19,7 @@ TECH_RE = re.compile(r"T\d{4}(?:\.\d{3})?", re.IGNORECASE)
 
 
 class NoteBuilder:
-    def __init__(self, retriever: DualPathRetriever, embedder: HashingEmbedder, llm_client: BaseLLMClient):
+    def __init__(self, retriever: DualPathRetriever, embedder: SentenceTransformerEmbedder, llm_client: BaseLLMClient):
         self.retriever = retriever
         self.embedder = embedder
         self.llm = llm_client

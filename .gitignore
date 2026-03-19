@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 
 .env
-memory/state.json
+memory/*
 output/rules.rules
 rules
+knowledge/*
+!knowledge/.gitkeep
+!memory/.gitkeep

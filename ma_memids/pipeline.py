@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import RuntimeConfig, SimilarityWeights, Thresholds
-from .embedding import HashingEmbedder
+from .embedding import SentenceTransformerEmbedder
 from .graph import NoteGraph
 from .knowledge import DualPathRetriever
 from .llm_client import BaseLLMClient, create_llm_client
@@ -41,7 +41,7 @@ class MAMemIDSPipeline:
         self.runtime = RuntimeConfig()
         self.weights = SimilarityWeights()
 
-        self.embedder = HashingEmbedder(dim=self.runtime.embedding_dim)
+        self.embedder = SentenceTransformerEmbedder(model_name=self.runtime.embedding_model)
         self.retriever = DualPathRetriever(embedder=self.embedder)
         self.retriever.load_knowledge(
             cve_path=cve_knowledge_path,
@@ -593,6 +593,8 @@ class MAMemIDSPipeline:
             "rule_notes": len(rule_notes),
             "traffic_notes": 0,
             "llm_model": self.llm.model_name(),
+            "embedding": self.embedder.metadata(),
+            "knowledge": self.retriever.stats(),
             "thresholds": self.thresholds.__dict__,
             "graph_index": self.graph.index_stats(),
             "sandbox_baseline": {
@@ -607,6 +609,7 @@ class MAMemIDSPipeline:
         self._enforce_rule_only_graph()
         payload = {
             "graph": self.graph.to_dict(),
+            "embedding": self.embedder.metadata(),
             "sandbox_baseline": self.sandbox_baseline,
         }
         self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -620,12 +623,46 @@ class MAMemIDSPipeline:
             self.thresholds = self.graph.thresholds
             self.sandbox = SandboxEvaluator(self.validator, thresholds=self.thresholds)
             self.rule_engine = RuleGenerationEngine(self.llm, thresholds=self.thresholds, runtime=self.runtime)
-            self.graph.rebuild_all_links()
         baseline_data = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
         if isinstance(baseline_data, dict):
             self.sandbox_baseline = baseline_data
-        if self._enforce_rule_only_graph():
+        changed = self._enforce_rule_only_graph()
+        embedding_meta = raw.get("embedding") if isinstance(raw, dict) and isinstance(raw.get("embedding"), dict) else {}
+        migrated = self._migrate_state_embeddings(embedding_meta)
+        if not migrated:
+            self.graph.rebuild_all_links()
+        if changed or migrated:
             self.save_state()
+
+    def _migrate_state_embeddings(self, embedding_meta: Dict[str, object]) -> bool:
+        notes = self.graph.all_notes()
+        if not notes:
+            return False
+
+        current_model = self.embedder.model_name
+        current_dim = self.embedder.dim
+
+        stored_model = str(embedding_meta.get("model_name") or "").strip()
+        try:
+            stored_dim = int(embedding_meta.get("dim")) if embedding_meta.get("dim") is not None else 0
+        except (TypeError, ValueError):
+            stored_dim = 0
+
+        note_dims = {len(note.embedding) for note in notes}
+        needs_migration = (
+            stored_model != current_model
+            or stored_dim != current_dim
+            or note_dims != {current_dim}
+        )
+        if not needs_migration:
+            return False
+
+        for note in notes:
+            timestamp = note.timestamp
+            self.note_builder.reembed_note(note)
+            note.timestamp = timestamp
+        self.graph.add_or_update_many(notes)
+        return True
 
     def _enforce_rule_only_graph(self) -> bool:
         return self.graph.retain_note_types({"rule"})
