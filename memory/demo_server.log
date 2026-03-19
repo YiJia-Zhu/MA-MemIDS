@@ -16,3 +16,52 @@
 2026-03-19 12:21:15,106 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
 2026-03-19 13:12:46,633 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
 2026-03-19 13:12:46,659 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:08:48,524 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:08:48,535 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 15:10:01,706 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-03-19 15:10:01,731 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:20:01,751 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:20:01,763 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 15:25:20,763 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-03-19 15:25:20,771 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:26:02,546 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:26:02,557 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 15:30:36,438 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['-'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:30:36,446 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['-'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:30:42,011 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:30:42,288 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:32:43,002 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['-'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:32:47,871 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:33:42,123 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:33:42,137 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 15:34:49,860 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:34:49,874 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 15:34:49,876 | ERROR | ma_memids.demo_server | demo_server SystemExit code=1
+Traceback (most recent call last):
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/site-packages/werkzeug/serving.py", line 759, in __init__
+    self.server_bind()
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/http/server.py", line 136, in server_bind
+    socketserver.TCPServer.server_bind(self)
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/socketserver.py", line 472, in server_bind
+    self.socket.bind(self.server_address)
+OSError: [Errno 98] Address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/storage/zyj_data/MA-MemIDS/demo_server.py", line 991, in <module>
+    app.run(host=host, port=port, debug=False)
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/site-packages/flask/app.py", line 662, in run
+    run_simple(t.cast(str, host), port, self, **options)
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/site-packages/werkzeug/serving.py", line 1093, in run_simple
+    srv = make_server(
+          ^^^^^^^^^^^^
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/site-packages/werkzeug/serving.py", line 930, in make_server
+    return ThreadedWSGIServer(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/storage/zyj_data/miniconda3/envs/thinkleap/lib/python3.11/site-packages/werkzeug/serving.py", line 782, in __init__
+    sys.exit(1)
+SystemExit: 1
+2026-03-19 15:34:49,878 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-03-19 15:35:22,979 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-03-19 15:35:22,991 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090

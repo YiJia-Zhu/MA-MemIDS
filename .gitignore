@@ -6,5 +6,8 @@ memory/*
 output/rules.rules
 rules
 knowledge/*
+huggingface_models/*
+
+!huggingface_models/huggingface_download.sh
 !knowledge/.gitkeep
 !memory/.gitkeep

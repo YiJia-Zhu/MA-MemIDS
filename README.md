@@ -183,7 +183,7 @@ python scripts/build_knowledge_index.py \
 
 ### 5.3 Embedding 模型
 
-当前默认 embedding 模型是 `sentence-transformers/all-MiniLM-L6-v2`，输出维度为 `384`。`SentenceTransformer` 会在首次运行时自动下载模型并缓存到本地；如需覆盖模型名，可设置环境变量 `MA_MEMIDS_EMBEDDING_MODEL`。知识检索层会离线缓存 Dense 向量；若环境中可用 `hnswlib`，还会自动为知识库构建 HNSW 索引，否则回退为精确 Dense 扫描。
+当前默认 embedding 模型是 `sentence-transformers/all-MiniLM-L6-v2`，输出维度为 `384`。若仓库内存在 `./huggingface_models/all-MiniLM-L6-v2`，代码会优先直接从该本地目录加载；也可以通过 `MA_MEMIDS_EMBEDDING_MODEL_DIR` 指定本地模型目录。如无本地目录，才回退到 Hugging Face 名称加载。知识检索层会离线缓存 Dense 向量；若环境中可用 `hnswlib`，还会自动为知识库构建 HNSW 索引，否则回退为精确 Dense 扫描。
 
 ---
 
