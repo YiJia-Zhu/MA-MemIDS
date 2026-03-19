@@ -40,6 +40,23 @@ class NullLLMClient(BaseLLMClient):
                 },
                 ensure_ascii=False,
             )
+        if "\"dense_query\"" in last or "\"sparse_terms\"" in last or "dense_query" in last:
+            return json.dumps(
+                {
+                    "intent": "Detect suspicious exploit behavior against a public-facing service",
+                    "sparse_terms": ["exploit", "payload", "public-facing", "rce"],
+                    "dense_query": "Exploit attempt against a public-facing application using suspicious payload indicators to achieve remote code execution",
+                    "cve_ids": [],
+                    "tech_ids": ["T1190"],
+                    "protocols": ["HTTP"],
+                    "payload_signals": ["payload"],
+                    "network_roles": ["client_to_server"],
+                    "service_ports": [80, 443],
+                    "selected_features": ["payload", "HTTP", "client_to_server"],
+                    "discarded_features": ["raw_ip", "ephemeral_src_port"],
+                },
+                ensure_ascii=False,
+            )
         if "输出 JSON" in last or "output JSON" in last.lower():
             return json.dumps(
                 {

@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency guard
 
 from .config import RuntimeConfig
 from .embedding import SentenceTransformerEmbedder
-from .models import EnrichedKnowledge, ExternalDoc, RetrievedItem
+from .models import EnrichedKnowledge, ExternalDoc, RetrievalPlan, RetrievedItem
 from .utils import dedupe_keep_order
 
 
@@ -200,12 +200,14 @@ class KnowledgeSourceIndex:
             "hnsw_reason": self._hnsw_reason,
         }
 
-    def retrieve(self, text: str) -> Tuple[List[RetrievedItem], Dict[str, object]]:
-        if not text.strip() or self.doc_count <= 0:
+    def retrieve(self, sparse_text: str, dense_text: Optional[str] = None) -> Tuple[List[RetrievedItem], Dict[str, object]]:
+        sparse_text = str(sparse_text or "").strip()
+        dense_text = str(dense_text or sparse_text).strip()
+        if (not sparse_text and not dense_text) or self.doc_count <= 0:
             return [], {"source": self.source, "doc_count": self.doc_count, "sparse_hits": [], "dense_hits": [], "fused_hits": []}
 
-        sparse_hits = self._sparse_search(text)
-        dense_hits = self._dense_search(text)
+        sparse_hits = self._sparse_search(sparse_text)
+        dense_hits = self._dense_search(dense_text)
         fused_hits = self._rrf_fuse(sparse_hits, dense_hits)
 
         items: List[RetrievedItem] = []
@@ -218,6 +220,7 @@ class KnowledgeSourceIndex:
         debug = {
             "source": self.source,
             "doc_count": self.doc_count,
+            "sparse_query_terms": _query_terms(sparse_text)[:30],
             "sparse_hits": [
                 {"doc_id": self._safe_doc_id(hit.rowid), "rank": hit.rank}
                 for hit in sparse_hits
@@ -779,13 +782,20 @@ class DualPathRetriever:
                 progress_callback=progress_callback,
             )
 
-    def retrieve(self, text: str) -> EnrichedKnowledge:
-        explicit_cves = dedupe_keep_order(m.group(0).upper() for m in CVE_RE.finditer(text))
-        explicit_techs = dedupe_keep_order(m.group(0).upper() for m in TECH_RE.finditer(text))
+    def retrieve(self, text: str, plan: Optional[RetrievalPlan] = None) -> EnrichedKnowledge:
+        raw_text = str(text or "")
+        sparse_text = (plan.sparse_query_text() if plan is not None else "").strip() or raw_text
+        dense_text = (plan.dense_query_text() if plan is not None else "").strip() or raw_text
 
-        cve_items, cve_debug = self._indexes["cve"].retrieve(text)
-        attack_items, attack_debug = self._indexes["attack"].retrieve(text)
-        cti_items, cti_debug = self._indexes["cti"].retrieve(text)
+        explicit_cves = dedupe_keep_order(m.group(0).upper() for m in CVE_RE.finditer(raw_text))
+        explicit_techs = dedupe_keep_order(m.group(0).upper() for m in TECH_RE.finditer(raw_text))
+        if plan is not None:
+            explicit_cves = dedupe_keep_order(explicit_cves + list(plan.cve_ids))
+            explicit_techs = dedupe_keep_order(explicit_techs + list(plan.tech_ids))
+
+        cve_items, cve_debug = self._indexes["cve"].retrieve(sparse_text, dense_text)
+        attack_items, attack_debug = self._indexes["attack"].retrieve(sparse_text, dense_text)
+        cti_items, cti_debug = self._indexes["cti"].retrieve(sparse_text, dense_text)
 
         all_cve_ids = set(explicit_cves)
         all_tech_ids = set(explicit_techs)
@@ -801,7 +811,11 @@ class DualPathRetriever:
             cve_ids=sorted(all_cve_ids),
             tech_ids=sorted(all_tech_ids),
             debug={
-                "query_terms": _query_terms(text)[:30],
+                "raw_query": raw_text[:1000],
+                "sparse_query": sparse_text,
+                "dense_query": dense_text,
+                "query_terms": _query_terms(sparse_text)[:30],
+                "plan": (plan.to_dict() if plan is not None else {}),
                 "retrieval": {
                     "cve": cve_debug,
                     "attack": attack_debug,

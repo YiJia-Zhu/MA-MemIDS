@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
+from .utils import dedupe_keep_order
+
 
 @dataclass
 class ExternalDoc:
@@ -77,6 +79,76 @@ class EnrichedKnowledge:
             tech_ids=list(data.get("tech_ids", [])),
             debug=dict(data.get("debug", {})),
         )
+
+
+@dataclass
+class RetrievalPlan:
+    intent: str = ""
+    sparse_terms: List[str] = field(default_factory=list)
+    dense_query: str = ""
+    cve_ids: List[str] = field(default_factory=list)
+    tech_ids: List[str] = field(default_factory=list)
+    protocols: List[str] = field(default_factory=list)
+    payload_signals: List[str] = field(default_factory=list)
+    network_roles: List[str] = field(default_factory=list)
+    service_ports: List[int] = field(default_factory=list)
+    selected_features: List[str] = field(default_factory=list)
+    discarded_features: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "sparse_terms": list(self.sparse_terms),
+            "dense_query": self.dense_query,
+            "cve_ids": list(self.cve_ids),
+            "tech_ids": list(self.tech_ids),
+            "protocols": list(self.protocols),
+            "payload_signals": list(self.payload_signals),
+            "network_roles": list(self.network_roles),
+            "service_ports": list(self.service_ports),
+            "selected_features": list(self.selected_features),
+            "discarded_features": list(self.discarded_features),
+        }
+
+    def seed_keywords(self) -> List[str]:
+        values: List[str] = []
+        values.extend(self.sparse_terms)
+        values.extend(self.payload_signals)
+        values.extend(self.protocols)
+        values.extend(self.network_roles)
+        values.extend(str(port) for port in self.service_ports)
+        return dedupe_keep_order([str(value).strip() for value in values if str(value).strip()])
+
+    def sparse_query_text(self) -> str:
+        tokens: List[str] = []
+        tokens.extend(self.sparse_terms)
+        tokens.extend(self.cve_ids)
+        tokens.extend(self.tech_ids)
+        tokens.extend(self.protocols)
+        tokens.extend(self.payload_signals)
+        tokens.extend(self.network_roles)
+        tokens.extend(str(port) for port in self.service_ports)
+        return " ".join(dedupe_keep_order([str(token).strip() for token in tokens if str(token).strip()]))
+
+    def dense_query_text(self) -> str:
+        parts: List[str] = []
+        if self.intent:
+            parts.append(f"[INTENT] {self.intent}")
+        if self.dense_query:
+            parts.append(f"[QUERY] {self.dense_query}")
+        if self.protocols:
+            parts.append(f"[PROTO] {', '.join(self.protocols[:4])}")
+        if self.payload_signals:
+            parts.append(f"[PAYLOAD] {', '.join(self.payload_signals[:8])}")
+        if self.cve_ids:
+            parts.append(f"[CVE] {', '.join(self.cve_ids[:5])}")
+        if self.tech_ids:
+            parts.append(f"[ATTACK] {', '.join(self.tech_ids[:5])}")
+        if self.network_roles:
+            parts.append(f"[ROLE] {', '.join(self.network_roles[:4])}")
+        if self.service_ports:
+            parts.append(f"[PORT] {', '.join(str(port) for port in self.service_ports[:6])}")
+        return "\n".join(parts).strip()
 
 
 @dataclass

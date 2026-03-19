@@ -126,6 +126,8 @@
         <h2>Init: 上传初始规则</h2>
         <p>调用 <code>/api/init_async</code>，异步显示初始化全过程</p>
       </div>
+      <p class="flow-note">阶段一初始化：规则文本 → 显式特征清单整理 → Retrieval Planner（产出 <code>sparse_query</code> / <code>dense_query</code>，并标记 selected / discarded features）→ 双路知识检索（Sparse BM25 + Dense + RRF）→ LLM 抽取 intent / keywords / tactics → 规则 Note embedding → 写入记忆图并持久化到 <code>memory/state.json</code>。</p>
+      <p class="flow-note">说明：初始化前会先加载或复用外部知识缓存；Sparse 使用 planner 产出的关键词查询，Dense 使用 planner 产出的语义查询，而不是直接把整条规则全文塞进 Dense。</p>
       <form id="init-form" class="form-grid">
         <label>
           模型（可选）
@@ -162,7 +164,7 @@
         <h2>Process: 上传 PCAP 或文本</h2>
         <p>调用 <code>/api/process_async</code>，实时显示步骤并支持折叠</p>
       </div>
-      <p class="flow-note">阶段二闭环：流量 → 双路检索 → 临时流量 Note → Top-k 相似性计算 → 规则增修 → 全规则集沙盒对比（仅分数提升通过）→ 失败分析 → 回到双路检索。</p>
+      <p class="flow-note">阶段二闭环：流量文本 / PCAP 解析 → 现有规则预检 → 显式特征清单整理 → Retrieval Planner（产出 <code>sparse_query</code> / <code>dense_query</code>，并标记 selected / discarded features）→ 双路知识检索 → LLM 抽取 intent / keywords / tactics → 临时流量 Note → Top-k 相似性计算 → 规则增修 → 全规则集沙盒对比（仅分数提升通过）→ 失败分析 → 回到 Retrieval Planner。</p>
       <p class="flow-note">说明：主分析流量是“未知标签”样本。系统会先通过 LLM 做攻击/正常判别，再将该 pcap 并入对应沙盒集合；合并时会按文件哈希去重，若同文件在另一集合会覆盖迁移。若你不上传沙盒样本，将自动使用默认目录 <code>sandbox_samples/attack</code> 与 <code>sandbox_samples/benign</code>。</p>
       <form id="process-form" class="form-grid">
         <label>

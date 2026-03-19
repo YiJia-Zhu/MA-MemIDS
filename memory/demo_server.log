@@ -65,3 +65,5 @@ SystemExit: 1
 2026-03-19 15:34:49,878 | INFO | ma_memids.demo_server | demo_server process exiting
 2026-03-19 15:35:22,979 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
 2026-03-19 15:35:22,991 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-03-19 21:21:42,531 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-03-19 21:21:42,754 | INFO | ma_memids.demo_server | demo_server process exiting

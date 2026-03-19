@@ -262,6 +262,26 @@ class MAMemIDSPipeline:
             _record_step(
                 f"dual_retrieval{suffix}",
                 {
+                    "retrieval_plan": (
+                        traffic_note_local.external_knowledge.debug.get("plan", {})
+                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                        else {}
+                    ),
+                    "feature_inventory": (
+                        traffic_note_local.external_knowledge.debug.get("feature_inventory", {})
+                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                        else {}
+                    ),
+                    "sparse_query": (
+                        traffic_note_local.external_knowledge.debug.get("sparse_query", "")
+                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                        else ""
+                    ),
+                    "dense_query": (
+                        traffic_note_local.external_knowledge.debug.get("dense_query", "")
+                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                        else ""
+                    ),
                     "cve_ids": traffic_note_local.external_knowledge.cve_ids[:10],
                     "tech_ids": traffic_note_local.external_knowledge.tech_ids[:10],
                     "feedback_blocks": feedback_blocks[-3:],

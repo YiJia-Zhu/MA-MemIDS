@@ -2,8 +2,8 @@
 
 基于你的 `MA_MemIDS.md` 落地的可运行工程版，核心实现了：
 
-- 阶段一初始化：规则 -> 混合知识检索（Sparse BM25 + Dense + RRF）-> Note 构建 -> 邻接图
-- 阶段二在线：流量 -> 现有规则预检（若已命中则提前结束）-> 混合知识检索 -> 流量 Note -> Note 相似性 Top-k -> 规则增修 -> 沙盒验证 -> 失败分析 -> 回到混合知识检索
+- 阶段一初始化：规则 -> 显式特征清单整理 -> 检索规划（Planner 产 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）-> 混合知识检索（Sparse BM25 + Dense + RRF）-> Note 构建 -> 邻接图
+- 阶段二在线：流量 -> 现有规则预检（若已命中则提前结束）-> 显式特征清单整理 -> 检索规划（Planner 产 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）-> 混合知识检索 -> 流量 Note -> Note 相似性 Top-k -> 规则增修 -> 沙盒验证 -> 失败分析 -> 回到检索规划
 - 沙盒评分：`Score = F2 * P_fpr`，并采用“全规则集前后对比”准入（仅 `Score_new > Score_base` 通过）
 - 记忆固化与演化：写回、级联、冗余检查
 
@@ -81,6 +81,8 @@ Prompt 全在：
 
 当前包含这些模板：
 
+- `RETRIEVAL_PLANNER_SYSTEM`
+- `RETRIEVAL_PLANNER_USER`
 - `NOTE_EXTRACTION_SYSTEM`
 - `NOTE_EXTRACTION_USER`
 - `RULE_REPAIR_SYSTEM`
@@ -91,6 +93,7 @@ Prompt 全在：
 
 调用关系：
 
+- `note_builder.py` 调用 `RETRIEVAL_PLANNER_*`（先基于显式 `feature_inventory` 生成 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）
 - `note_builder.py` 调用 `NOTE_EXTRACTION_*`（用于从规则/流量文本提取 `intent/keywords/tactics`）
 - `rule_engine.py` 调用 `RULE_REPAIR_*`、`RULE_GENERATE_*`、`FAILURE_ANALYSIS_USER`（用于增修规则与失败重试）
 
@@ -116,8 +119,8 @@ Prompt 全在：
 主编排在 `ma_memids/pipeline.py`：
 
 - 初始化组件：retriever/embedder/LLM/graph/validator
-- 处理流量：PCAP 解析 -> 现有规则集预检（已触发则不再生成新规则）-> 混合检索（Sparse BM25 + Dense + RRF）-> 流量 Note -> Note 相似性 Top-k -> 规则提案
-- 沙盒循环：先计算当前全规则集基线分数，再对“修改后全规则集”回放验证；仅当 `Score_new > Score_base` 才通过并固化（基线指标会缓存并在通过后更新）-> 失败分析（语法报错 / 召回不足 / FPR 过高）-> 回到混合检索重建 Note 与提案（最多 `max 3` 次）
+- 处理流量：PCAP 解析 -> 现有规则集预检（已触发则不再生成新规则）-> 显式特征清单整理 -> 检索规划（Sparse 用关键词查询，Dense 用语义查询，并记录 `selected_features` / `discarded_features`）-> 混合检索（Sparse BM25 + Dense + RRF）-> 流量 Note -> Note 相似性 Top-k -> 规则提案
+- 沙盒循环：先计算当前全规则集基线分数，再对“修改后全规则集”回放验证；仅当 `Score_new > Score_base` 才通过并固化（基线指标会缓存并在通过后更新）-> 失败分析（语法报错 / 召回不足 / FPR 过高）-> 回到“显式特征清单整理 + 检索规划 + 混合检索”重建 Note 与提案（最多 `max 3` 次）
 - 通过后固化：更新图、写回 state、检查合并候选
 
 ---
@@ -167,6 +170,13 @@ python main.py \
 - Sparse 索引：SQLite FTS5 / BM25
 - Dense 向量缓存：`all-MiniLM-L6-v2`
 - 候选融合：RRF，`k=60`
+
+查询侧不会直接把整段原始规则/流量全文送进 Dense 检索。当前实现会先整理显式 `feature_inventory`，再由 Retrieval Planner 生成：
+
+- `sparse_query`
+- `dense_query`
+- `selected_features`
+- `discarded_features`
 
 ATT&CK 和 CVE 虽然原始格式不同，但进入检索层后共用同一套 `Sparse + Dense + RRF` 搜索逻辑。
 下载地址：
