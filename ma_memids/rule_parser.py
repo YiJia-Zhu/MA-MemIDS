@@ -12,6 +12,7 @@ RULE_HEADER_RE = re.compile(
 )
 CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 TECH_RE = re.compile(r"T\d{4}(?:\.\d{3})?", re.IGNORECASE)
+REFERENCE_RE = re.compile(r"\breference\s*:\s*([^;]+)", re.IGNORECASE)
 
 
 def extract_sid(rule_text: str) -> Optional[int]:
@@ -41,6 +42,65 @@ def ensure_sid(rule_text: str, sid: int) -> str:
     return rule_text + f" sid:{sid};"
 
 
+def _normalize_reference_type(value: str) -> str:
+    ref_type = str(value or "").strip().lower()
+    if ref_type in {"url", "uri", "link", "links"}:
+        return "url"
+    if ref_type in {"cve", "cveid", "candidate"}:
+        return "cve"
+    if ref_type in {"attack", "mitre", "mitre-attack", "attack-technique", "technique"}:
+        return "attack"
+    return ref_type or "raw"
+
+
+def _normalize_cve_reference(value: str) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    matches = [m.group(0).upper() for m in CVE_RE.finditer(text)]
+    if matches:
+        return dedupe_keep_order(matches)
+    compact = re.findall(r"\b(\d{4})[-_]?(\d{4,})\b", text)
+    out: List[str] = []
+    for year, seq in compact:
+        out.append(f"CVE-{year}-{seq}")
+    return dedupe_keep_order(out)
+
+
+def parse_rule_references(rule_text: str) -> List[Dict[str, object]]:
+    references: List[Dict[str, object]] = []
+    for match in REFERENCE_RE.finditer(rule_text):
+        raw_value = str(match.group(1) or "").strip()
+        if not raw_value:
+            continue
+
+        ref_type = "raw"
+        ref_value = raw_value
+        if "," in raw_value:
+            left, right = raw_value.split(",", 1)
+            ref_type = _normalize_reference_type(left)
+            ref_value = right.strip()
+        elif raw_value.lower().startswith(("http://", "https://")):
+            ref_type = "url"
+
+        cve_ids = _normalize_cve_reference(ref_value if ref_type == "cve" else raw_value)
+        tech_ids = dedupe_keep_order(m.group(0).upper() for m in TECH_RE.finditer(raw_value))
+        url = ref_value if ref_type == "url" else ""
+
+        references.append(
+            {
+                "type": ref_type,
+                "value": ref_value,
+                "raw": raw_value,
+                "url": url,
+                "cve_ids": cve_ids,
+                "tech_ids": tech_ids,
+            }
+        )
+
+    return references
+
+
 def parse_rule_fields(rule_text: str) -> Dict[str, object]:
     header = RULE_HEADER_RE.search(rule_text.strip())
     protocol = None
@@ -55,9 +115,15 @@ def parse_rule_fields(rule_text: str) -> Dict[str, object]:
     contents = re.findall(r'content\s*:\s*"([^"]+)"', rule_text, flags=re.IGNORECASE)
     pcres = re.findall(r'pcre\s*:\s*"([^"]+)"', rule_text, flags=re.IGNORECASE)
     msg = re.search(r'msg\s*:\s*"([^"]+)"', rule_text, flags=re.IGNORECASE)
+    references = parse_rule_references(rule_text)
 
     cve_ids = dedupe_keep_order(m.group(0).upper() for m in CVE_RE.finditer(rule_text))
     tech_ids = dedupe_keep_order(m.group(0).upper() for m in TECH_RE.finditer(rule_text))
+    for reference in references:
+        cve_ids.extend(str(item).upper().strip() for item in reference.get("cve_ids", []) if str(item).strip())
+        tech_ids.extend(str(item).upper().strip() for item in reference.get("tech_ids", []) if str(item).strip())
+    cve_ids = dedupe_keep_order(cve_ids)
+    tech_ids = dedupe_keep_order(tech_ids)
 
     keywords: List[str] = []
     keywords.extend(contents)
@@ -74,5 +140,11 @@ def parse_rule_fields(rule_text: str) -> Dict[str, object]:
         "keywords": dedupe_keep_order(keywords),
         "cve_ids": cve_ids,
         "tech_ids": tech_ids,
+        "references": references,
+        "reference_urls": dedupe_keep_order(
+            str(item.get("url") or "").strip()
+            for item in references
+            if str(item.get("url") or "").strip()
+        ),
         "sid": extract_sid(rule_text),
     }

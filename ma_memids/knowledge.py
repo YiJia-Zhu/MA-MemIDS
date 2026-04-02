@@ -200,7 +200,12 @@ class KnowledgeSourceIndex:
             "hnsw_reason": self._hnsw_reason,
         }
 
-    def retrieve(self, sparse_text: str, dense_text: Optional[str] = None) -> Tuple[List[RetrievedItem], Dict[str, object]]:
+    def retrieve(
+        self,
+        sparse_text: str,
+        dense_text: Optional[str] = None,
+        pinned_doc_ids: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[RetrievedItem], Dict[str, object]]:
         sparse_text = str(sparse_text or "").strip()
         dense_text = str(dense_text or sparse_text).strip()
         if (not sparse_text and not dense_text) or self.doc_count <= 0:
@@ -209,6 +214,7 @@ class KnowledgeSourceIndex:
         sparse_hits = self._sparse_search(sparse_text)
         dense_hits = self._dense_search(dense_text)
         fused_hits = self._rrf_fuse(sparse_hits, dense_hits)
+        fused_hits, pinned_hits = self._prepend_pinned_hits(fused_hits, pinned_doc_ids or [])
 
         items: List[RetrievedItem] = []
         for hit in fused_hits[: self.top_k]:
@@ -229,6 +235,7 @@ class KnowledgeSourceIndex:
                 {"doc_id": self._safe_doc_id(hit.rowid), "rank": hit.rank, "score": round(float(hit.score), 6)}
                 for hit in dense_hits
             ],
+            "pinned_hits": pinned_hits,
             "fused_hits": [
                 {"doc_id": self._safe_doc_id(hit.rowid), "rank": rank + 1, "score": round(float(hit.score), 6), "hit_type": hit.hit_type}
                 for rank, hit in enumerate(fused_hits[: self.top_k])
@@ -483,6 +490,67 @@ class KnowledgeSourceIndex:
             hit_type = "rrf_" + "_".join(modes) if modes else "rrf"
             out.append(FusedHit(rowid=rowid, score=score, hit_type=hit_type))
         return out
+
+    def _prepend_pinned_hits(
+        self,
+        fused_hits: Sequence[FusedHit],
+        pinned_doc_ids: Sequence[str],
+    ) -> Tuple[List[FusedHit], List[Dict[str, object]]]:
+        if not pinned_doc_ids:
+            return list(fused_hits), []
+
+        pinned_debug: List[Dict[str, object]] = []
+        pinned_rowids: List[int] = []
+        missing_ids: List[str] = []
+        for doc_id in dedupe_keep_order(str(item).strip() for item in pinned_doc_ids if str(item).strip()):
+            rowid = self._lookup_rowid_by_doc_id(doc_id)
+            if rowid is None:
+                missing_ids.append(doc_id)
+                continue
+            pinned_rowids.append(rowid)
+            pinned_debug.append({"requested_doc_id": doc_id, "matched_doc_id": self._safe_doc_id(rowid)})
+
+        if missing_ids:
+            pinned_debug.extend({"requested_doc_id": doc_id, "matched_doc_id": "", "status": "missing"} for doc_id in missing_ids)
+
+        if not pinned_rowids:
+            return list(fused_hits), pinned_debug
+
+        out: List[FusedHit] = []
+        seen = set()
+        for offset, rowid in enumerate(pinned_rowids):
+            out.append(FusedHit(rowid=rowid, score=1_000_000.0 - offset, hit_type="pinned_exact"))
+            seen.add(rowid)
+        for hit in fused_hits:
+            if hit.rowid in seen:
+                continue
+            out.append(hit)
+        return out, pinned_debug
+
+    def _lookup_rowid_by_doc_id(self, doc_id: str) -> Optional[int]:
+        if self._conn is None:
+            return None
+        raw = str(doc_id or "").strip()
+        if not raw:
+            return None
+        row = self._conn.execute(
+            "SELECT rowid FROM docs WHERE lower(doc_id) = lower(?) LIMIT 1",
+            (raw,),
+        ).fetchone()
+        if row is not None:
+            return int(row["rowid"])
+
+        compact = _identifier_compact(raw).lower()
+        if not compact:
+            return None
+        row = self._conn.execute(
+            "SELECT rowid FROM docs "
+            "WHERE lower(replace(replace(doc_id, '-', ''), '_', '')) = ? LIMIT 1",
+            (compact,),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["rowid"])
 
     def _get_doc(self, rowid: int) -> Optional[ExternalDoc]:
         cached = self._doc_cache.get(rowid)
@@ -789,12 +857,16 @@ class DualPathRetriever:
 
         explicit_cves = dedupe_keep_order(m.group(0).upper() for m in CVE_RE.finditer(raw_text))
         explicit_techs = dedupe_keep_order(m.group(0).upper() for m in TECH_RE.finditer(raw_text))
+        trusted_cves: List[str] = []
+        trusted_techs: List[str] = []
         if plan is not None:
             explicit_cves = dedupe_keep_order(explicit_cves + list(plan.cve_ids))
             explicit_techs = dedupe_keep_order(explicit_techs + list(plan.tech_ids))
+            trusted_cves = dedupe_keep_order(list(plan.trusted_cve_ids))
+            trusted_techs = dedupe_keep_order(list(plan.trusted_tech_ids))
 
-        cve_items, cve_debug = self._indexes["cve"].retrieve(sparse_text, dense_text)
-        attack_items, attack_debug = self._indexes["attack"].retrieve(sparse_text, dense_text)
+        cve_items, cve_debug = self._indexes["cve"].retrieve(sparse_text, dense_text, pinned_doc_ids=trusted_cves)
+        attack_items, attack_debug = self._indexes["attack"].retrieve(sparse_text, dense_text, pinned_doc_ids=trusted_techs)
         cti_items, cti_debug = self._indexes["cti"].retrieve(sparse_text, dense_text)
 
         all_cve_ids = set(explicit_cves)
@@ -803,6 +875,11 @@ class DualPathRetriever:
             all_cve_ids.update(m.group(0).upper() for m in CVE_RE.finditer(f"{item.doc.doc_id} {item.doc.title} {item.doc.text}"))
         for item in attack_items + cti_items:
             all_tech_ids.update(m.group(0).upper() for m in TECH_RE.finditer(f"{item.doc.doc_id} {item.doc.title} {item.doc.text}"))
+
+        reference_conflicts = {
+            "missing_trusted_cve_docs": [doc_id for doc_id in trusted_cves if doc_id not in {item.doc.doc_id.upper() for item in cve_items}],
+            "missing_trusted_attack_docs": [doc_id for doc_id in trusted_techs if doc_id not in {item.doc.doc_id.upper() for item in attack_items}],
+        }
 
         return EnrichedKnowledge(
             cve_docs=cve_items,
@@ -816,6 +893,11 @@ class DualPathRetriever:
                 "dense_query": dense_text,
                 "query_terms": _query_terms(sparse_text)[:30],
                 "plan": (plan.to_dict() if plan is not None else {}),
+                "trusted_reference_ids": {
+                    "cve_ids": trusted_cves,
+                    "tech_ids": trusted_techs,
+                },
+                "reference_conflicts": reference_conflicts,
                 "retrieval": {
                     "cve": cve_debug,
                     "attack": attack_debug,

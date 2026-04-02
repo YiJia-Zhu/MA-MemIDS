@@ -4,7 +4,7 @@ import ipaddress
 import json
 import re
 import uuid
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .embedding import SentenceTransformerEmbedder
 from .knowledge import DualPathRetriever
@@ -16,6 +16,7 @@ from .prompts import (
     RETRIEVAL_PLANNER_SYSTEM,
     RETRIEVAL_PLANNER_USER,
 )
+from .reference_resolver import ReferenceResolver
 from .rule_parser import parse_rule_fields
 from .utils import dedupe_keep_order, now_iso
 
@@ -35,6 +36,7 @@ class NoteBuilder:
         self.retriever = retriever
         self.embedder = embedder
         self.llm = llm_client
+        self.reference_resolver = ReferenceResolver(llm_client)
 
     def build_rule_note(
         self,
@@ -46,8 +48,11 @@ class NoteBuilder:
         tactic_hints: Optional[Iterable[str]] = None,
         extra_knowledge: Optional[EnrichedKnowledge] = None,
         extra_metadata: Optional[Dict[str, object]] = None,
+        parsed_fields: Optional[Dict[str, object]] = None,
+        reference_evidence: Optional[Dict[str, object]] = None,
     ) -> Note:
-        fields = parse_rule_fields(rule_text)
+        fields = dict(parsed_fields or parse_rule_fields(rule_text))
+        reference_evidence = dict(reference_evidence or self._resolve_reference_evidence(fields, analysis_note=analysis_note))
         seeded_keywords = list(keyword_hints or [])
         seeded_tactics = [str(x).upper().strip() for x in (tactic_hints or []) if str(x).strip()]
         if analysis_note is not None:
@@ -55,17 +60,18 @@ class NoteBuilder:
             seeded_tactics = seeded_tactics + list(analysis_note.tactics)
 
         rule_network_context = self._compact_rule_network_context(fields)
-        feature_inventory = self._build_rule_feature_inventory(rule_text, fields, rule_network_context)
+        feature_inventory = self._build_rule_feature_inventory(rule_text, fields, rule_network_context, reference_evidence)
         retrieval_plan = self._plan_retrieval(
             artifact_type="rule",
             text=rule_text,
             feature_inventory=feature_inventory,
             network_context=rule_network_context,
-            seed_keywords=list(fields.get("keywords", [])) + seeded_keywords,
-            seed_tactics=list(fields.get("tech_ids", [])) + seeded_tactics,
-            known_cves=list(fields.get("cve_ids", [])),
-            known_techs=list(fields.get("tech_ids", [])),
+            seed_keywords=list(fields.get("keywords", [])) + seeded_keywords + list(reference_evidence.get("trusted_terms", [])),
+            seed_tactics=list(fields.get("tech_ids", [])) + seeded_tactics + list(reference_evidence.get("trusted_tech_ids", [])),
+            known_cves=list(fields.get("cve_ids", [])) + list(reference_evidence.get("trusted_cve_ids", [])),
+            known_techs=list(fields.get("tech_ids", [])) + list(reference_evidence.get("trusted_tech_ids", [])),
         )
+        self._apply_reference_evidence_to_plan(retrieval_plan, reference_evidence)
 
         hint_knowledge: List[EnrichedKnowledge] = []
         if extra_knowledge is not None:
@@ -77,7 +83,12 @@ class NoteBuilder:
             knowledge = self._merge_knowledge(*hint_knowledge)
         else:
             knowledge = self.retriever.retrieve(rule_text, plan=retrieval_plan)
-        self._attach_retrieval_debug(knowledge, retrieval_plan=retrieval_plan, feature_inventory=feature_inventory)
+        self._attach_retrieval_debug(
+            knowledge,
+            retrieval_plan=retrieval_plan,
+            feature_inventory=feature_inventory,
+            reference_evidence=reference_evidence,
+        )
 
         if analysis_note is not None:
             extraction = LLMNoteExtraction(
@@ -120,6 +131,7 @@ class NoteBuilder:
                 "src_port": fields.get("src_port"),
                 "dst_ip": fields.get("dst_ip"),
                 "dst_port": fields.get("dst_port"),
+                "reference_urls": list(reference_evidence.get("source_urls", [])),
             }
         )
         if analysis_note is not None:
@@ -145,6 +157,25 @@ class NoteBuilder:
             protocol=fields.get("protocol"),
             sid=sid,
             metadata=metadata,
+        )
+
+    def resolve_rule_reference_evidence_batch(
+        self,
+        parsed_rules: Iterable[Dict[str, object]],
+        *,
+        progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        prepared_rules = [dict(item) if isinstance(item, dict) else {} for item in parsed_rules]
+        reference_batches = []
+        for fields in prepared_rules:
+            references = fields.get("references", [])
+            if isinstance(references, list):
+                reference_batches.append(references)
+            else:
+                reference_batches.append([])
+        return self.reference_resolver.resolve_reference_batches(
+            reference_batches,
+            progress_callback=progress_callback,
         )
 
     def build_traffic_note(
@@ -400,6 +431,7 @@ class NoteBuilder:
         rule_text: str,
         fields: Dict[str, object],
         network_context: Dict[str, object],
+        reference_evidence: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         raw_keywords = [str(x).strip() for x in fields.get("keywords", []) if str(x).strip()]
         clean_keywords = self._clean_retrieval_terms(raw_keywords)
@@ -415,6 +447,15 @@ class NoteBuilder:
             },
             "raw_keywords": raw_keywords[:20],
             "clean_keyword_candidates": clean_keywords[:20],
+            "rule_references": list(fields.get("references", []))[:12],
+            "reference_evidence": {
+                "trusted_cve_ids": list(reference_evidence.get("trusted_cve_ids", []))[:12],
+                "trusted_tech_ids": list(reference_evidence.get("trusted_tech_ids", []))[:12],
+                "trusted_terms": list(reference_evidence.get("trusted_terms", []))[:16],
+                "reference_summary": str(reference_evidence.get("reference_summary") or "")[:280],
+                "source_urls": list(reference_evidence.get("source_urls", []))[:8],
+                "resolved_references": list(reference_evidence.get("resolved_references", []))[:8],
+            } if isinstance(reference_evidence, dict) and reference_evidence else {},
             "explicit_ids": {
                 "cve_ids": [str(x).upper().strip() for x in fields.get("cve_ids", []) if str(x).strip()],
                 "tech_ids": [str(x).upper().strip() for x in fields.get("tech_ids", []) if str(x).strip()],
@@ -450,11 +491,56 @@ class NoteBuilder:
         *,
         retrieval_plan: RetrievalPlan,
         feature_inventory: Dict[str, object],
+        reference_evidence: Optional[Dict[str, object]] = None,
     ) -> None:
         debug = dict(knowledge.debug) if isinstance(knowledge.debug, dict) else {}
         debug["plan"] = retrieval_plan.to_dict()
         debug["feature_inventory"] = dict(feature_inventory)
+        if isinstance(reference_evidence, dict) and reference_evidence:
+            debug["reference_resolution"] = dict(reference_evidence)
         knowledge.debug = debug
+
+    def _resolve_reference_evidence(self, fields: Dict[str, object], *, analysis_note: Optional[Note]) -> Dict[str, object]:
+        if analysis_note is not None:
+            return {}
+        references = fields.get("references", [])
+        if not isinstance(references, list) or not references:
+            return {}
+        return self.reference_resolver.resolve_rule_references(references)
+
+    def _apply_reference_evidence_to_plan(
+        self,
+        retrieval_plan: RetrievalPlan,
+        reference_evidence: Optional[Dict[str, object]],
+    ) -> None:
+        if not isinstance(reference_evidence, dict) or not reference_evidence:
+            return
+
+        trusted_cve_ids = dedupe_keep_order(
+            str(item).upper().strip()
+            for item in reference_evidence.get("trusted_cve_ids", [])
+            if str(item).strip()
+        )[:12]
+        trusted_tech_ids = dedupe_keep_order(
+            str(item).upper().strip()
+            for item in reference_evidence.get("trusted_tech_ids", [])
+            if str(item).strip()
+        )[:12]
+        trusted_terms = self._clean_retrieval_terms(reference_evidence.get("trusted_terms", []))[:16]
+        reference_summary = str(reference_evidence.get("reference_summary") or "").strip()
+
+        retrieval_plan.trusted_cve_ids = dedupe_keep_order(trusted_cve_ids + retrieval_plan.trusted_cve_ids)[:12]
+        retrieval_plan.trusted_tech_ids = dedupe_keep_order(trusted_tech_ids + retrieval_plan.trusted_tech_ids)[:12]
+        retrieval_plan.cve_ids = dedupe_keep_order(trusted_cve_ids + retrieval_plan.cve_ids)[:12]
+        retrieval_plan.tech_ids = dedupe_keep_order(trusted_tech_ids + retrieval_plan.tech_ids)[:12]
+        retrieval_plan.sparse_terms = dedupe_keep_order(trusted_terms + retrieval_plan.sparse_terms)[:24]
+        retrieval_plan.selected_features = dedupe_keep_order(
+            trusted_cve_ids + trusted_tech_ids + trusted_terms + retrieval_plan.selected_features
+        )[:24]
+        if reference_summary:
+            retrieval_plan.dense_query = self._sanitize_dense_query(
+                f"{retrieval_plan.dense_query}. trusted reference: {reference_summary}"
+            ) or retrieval_plan.dense_query
 
     def _extract_semantics(
         self,

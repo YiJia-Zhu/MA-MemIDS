@@ -88,6 +88,8 @@ class RetrievalPlan:
     dense_query: str = ""
     cve_ids: List[str] = field(default_factory=list)
     tech_ids: List[str] = field(default_factory=list)
+    trusted_cve_ids: List[str] = field(default_factory=list)
+    trusted_tech_ids: List[str] = field(default_factory=list)
     protocols: List[str] = field(default_factory=list)
     payload_signals: List[str] = field(default_factory=list)
     network_roles: List[str] = field(default_factory=list)
@@ -102,6 +104,8 @@ class RetrievalPlan:
             "dense_query": self.dense_query,
             "cve_ids": list(self.cve_ids),
             "tech_ids": list(self.tech_ids),
+            "trusted_cve_ids": list(self.trusted_cve_ids),
+            "trusted_tech_ids": list(self.trusted_tech_ids),
             "protocols": list(self.protocols),
             "payload_signals": list(self.payload_signals),
             "network_roles": list(self.network_roles),

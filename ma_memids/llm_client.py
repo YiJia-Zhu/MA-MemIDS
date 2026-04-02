@@ -30,6 +30,16 @@ class NullLLMClient(BaseLLMClient):
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
         _ = temperature
         last = messages[-1]["content"] if messages else ""
+        if "\"reference_summary\"" in last or "\"trusted_terms\"" in last:
+            return json.dumps(
+                {
+                    "reference_summary": "Reference page discussing a public-facing exploit scenario",
+                    "cve_ids": [],
+                    "tech_ids": ["T1190"],
+                    "trusted_terms": ["exploit", "public-facing", "remote code execution"],
+                },
+                ensure_ascii=False,
+            )
         if "\"is_attack\"" in last or "is_attack" in last:
             return json.dumps(
                 {

@@ -16,7 +16,7 @@ from .note_builder import NoteBuilder
 from .pcap_parser import PCAPParser
 from .prompts import TRAFFIC_CLASSIFICATION_SYSTEM, TRAFFIC_CLASSIFICATION_USER
 from .rule_engine import RuleGenerationEngine
-from .rule_parser import extract_sid
+from .rule_parser import extract_sid, parse_rule_fields
 from .utils import dedupe_keep_order, now_iso
 from .validation import SandboxEvaluator, SuricataValidator
 
@@ -78,23 +78,60 @@ class MAMemIDSPipeline:
         if max_rules is not None and max_rules <= 0:
             raise ValueError("max_rules must be a positive integer")
 
+        rules: List[str] = []
+        for rule in self._iter_rules_from_path(path):
+            rules.append(rule)
+            if max_rules is not None and len(rules) >= max_rules:
+                break
+
+        total_rules = len(rules)
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "init_prepare",
+                    "count": total_rules,
+                    "source_path": str(path),
+                    "max_rules": max_rules,
+                }
+            )
+
+        parsed_rules = [parse_rule_fields(rule) for rule in rules]
+
+        def _emit_reference_progress(event: Dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            payload = dict(event)
+            payload.setdefault("source_path", str(path))
+            payload.setdefault("max_rules", max_rules)
+            progress_callback(payload)
+
+        prefetched_reference_evidence = self.note_builder.resolve_rule_reference_evidence_batch(
+            parsed_rules,
+            progress_callback=_emit_reference_progress,
+        )
+
         count = 0
         new_notes: List[Note] = []
-        for rule in self._iter_rules_from_path(path):
-            note = self.note_builder.build_rule_note(rule)
+        for idx, rule in enumerate(rules):
+            fields = parsed_rules[idx]
+            reference_evidence = prefetched_reference_evidence[idx] if idx < len(prefetched_reference_evidence) else {}
+            note = self.note_builder.build_rule_note(
+                rule,
+                parsed_fields=fields,
+                reference_evidence=reference_evidence,
+            )
             new_notes.append(note)
             count += 1
-            if progress_callback and (count == 1 or count % 25 == 0):
+            if progress_callback and (count == 1 or count % 25 == 0 or count == total_rules):
                 progress_callback(
                     {
                         "event": "init_progress",
                         "count": count,
+                        "total_rules": total_rules,
                         "source_path": str(path),
                         "max_rules": max_rules,
                     }
                 )
-            if max_rules is not None and count >= max_rules:
-                break
 
         self.graph.add_or_update_many(new_notes)
         self.save_state()
@@ -103,6 +140,7 @@ class MAMemIDSPipeline:
                 {
                     "event": "init_done",
                     "count": count,
+                    "total_rules": total_rules,
                     "source_path": str(path),
                 }
             )
@@ -209,6 +247,11 @@ class MAMemIDSPipeline:
             _record_step(
                 "pcap_parse",
                 {
+                    "parser_backend": summary.parser_backend,
+                    "packets_seen": summary.packets_seen,
+                    "packets_sampled": summary.packets_sampled,
+                    "packet_limit_reached": summary.packet_limit_reached,
+                    "primary_flow": summary.primary_flow,
                     "protocol": summary.protocol,
                     "src_ip": summary.src_ip,
                     "dst_ip": summary.dst_ip,
@@ -216,6 +259,10 @@ class MAMemIDSPipeline:
                     "dst_port": summary.dst_port,
                     "http_method": summary.http_method,
                     "http_uri": summary.http_uri,
+                    "payload_bytes_seen": summary.payload_bytes_seen,
+                    "payload_bytes_kept": summary.payload_bytes_kept,
+                    "payload_truncated": summary.payload_truncated,
+                    "binary_payload_skipped": summary.binary_payload_skipped,
                     "payload_preview": summary.payload_text[:300],
                 },
             )

@@ -2,7 +2,7 @@
 
 基于你的 `MA_MemIDS.md` 落地的可运行工程版，核心实现了：
 
-- 阶段一初始化：规则 -> 显式特征清单整理 -> 检索规划（Planner 产 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）-> 混合知识检索（Sparse BM25 + Dense + RRF）-> Note 构建 -> 邻接图
+- 阶段一初始化：规则 -> 显式特征清单整理 -> `reference:*` 可信证据解析（结构化 ID + URL best-effort 网页解析/缓存；init 会批量有界并发预抓取）-> 检索规划（Planner 产 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）-> 混合知识检索（Sparse BM25 + Dense + RRF，并对 reference 中的可信 CVE / ATT&CK ID 做 exact pin）-> Note 构建 -> 邻接图
 - 阶段二在线：流量 -> 现有规则预检（若已命中则提前结束）-> 显式特征清单整理 -> 检索规划（Planner 产 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）-> 混合知识检索 -> 流量 Note -> Note 相似性 Top-k -> 规则增修 -> 沙盒验证 -> 失败分析 -> 回到检索规划
 - 沙盒评分：`Score = F2 * P_fpr`，并采用“全规则集前后对比”准入（仅 `Score_new > Score_base` 通过）
 - 记忆固化与演化：写回、级联、冗余检查
@@ -63,7 +63,8 @@ MA_MemIDS/
     ├── prompts.py               # 所有 prompt 模板集中管理
     ├── llm_client.py            # API 客户端工厂（OpenAI/DeepSeek/GLM）
     ├── rule_parser.py           # Suricata 规则字段解析（sid/rev/protocol/content...）
-    ├── pcap_parser.py           # PCAP -> 结构化文本摘要（scapy/tshark）
+    ├── reference_resolver.py    # 解析规则中的 reference:*，网页抓取/缓存/结构化摘要
+    ├── pcap_parser.py           # PCAP -> 结构化文本摘要（流式采样、限包、限 payload、跳过二进制下载 body）
     ├── note_builder.py          # 规则Note/流量Note同构构建 + 重嵌入
     ├── graph.py                 # 邻接图构建、统一相似度、ANN候选召回、Top-k检索、冗余合并候选
     ├── validation.py            # Suricata语法/回放验证 + F2*P_fpr + 失败诊断
@@ -83,6 +84,8 @@ Prompt 全在：
 
 - `RETRIEVAL_PLANNER_SYSTEM`
 - `RETRIEVAL_PLANNER_USER`
+- `REFERENCE_PARSE_SYSTEM`
+- `REFERENCE_PARSE_USER`
 - `NOTE_EXTRACTION_SYSTEM`
 - `NOTE_EXTRACTION_USER`
 - `RULE_REPAIR_SYSTEM`
@@ -93,7 +96,8 @@ Prompt 全在：
 
 调用关系：
 
-- `note_builder.py` 调用 `RETRIEVAL_PLANNER_*`（先基于显式 `feature_inventory` 生成 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）
+- `note_builder.py` 调用 `REFERENCE_PARSE_*`（仅规则初始化侧：当规则里有 `reference:url,...` 时，对网页做独立结构化解析，并把结果压成可信证据）
+- `note_builder.py` 调用 `RETRIEVAL_PLANNER_*`（先基于显式 `feature_inventory` + `reference_evidence` 生成 `sparse_query` / `dense_query`，并标记 `selected_features` / `discarded_features`）
 - `note_builder.py` 调用 `NOTE_EXTRACTION_*`（用于从规则/流量文本提取 `intent/keywords/tactics`）
 - `rule_engine.py` 调用 `RULE_REPAIR_*`、`RULE_GENERATE_*`、`FAILURE_ANALYSIS_USER`（用于增修规则与失败重试）
 
@@ -119,7 +123,8 @@ Prompt 全在：
 主编排在 `ma_memids/pipeline.py`：
 
 - 初始化组件：retriever/embedder/LLM/graph/validator
-- 处理流量：PCAP 解析 -> 现有规则集预检（已触发则不再生成新规则）-> 显式特征清单整理 -> 检索规划（Sparse 用关键词查询，Dense 用语义查询，并记录 `selected_features` / `discarded_features`）-> 混合检索（Sparse BM25 + Dense + RRF）-> 流量 Note -> Note 相似性 Top-k -> 规则提案
+- 初始化规则：规则解析 -> 显式特征清单整理 -> `reference:*` 可信证据解析（结构化 ID 直接吸收；URL 页面抓取失败则自动降级；init 内会先批量并发预抓取 reference）-> 检索规划 -> 混合检索（reference 给出的可信 CVE / ATT&CK ID 会被 exact pin 到检索结果前列）-> 规则 Note
+- 处理流量：PCAP 解析（流式采样、限包、限 payload、对大文件下载/二进制 body 自动跳过）-> 现有规则集预检（已触发则不再生成新规则）-> 显式特征清单整理 -> 检索规划（Sparse 用关键词查询，Dense 用语义查询，并记录 `selected_features` / `discarded_features`）-> 混合检索（Sparse BM25 + Dense + RRF）-> 流量 Note -> Note 相似性 Top-k -> 规则提案
 - 沙盒循环：先计算当前全规则集基线分数，再对“修改后全规则集”回放验证；仅当 `Score_new > Score_base` 才通过并固化（基线指标会缓存并在通过后更新）-> 失败分析（语法报错 / 召回不足 / FPR 过高）-> 回到“显式特征清单整理 + 检索规划 + 混合检索”重建 Note 与提案（最多 `max 3` 次）
 - 通过后固化：更新图、写回 state、检查合并候选
 
@@ -139,6 +144,7 @@ Prompt 全在：
 - `MA_MEMIDS_DEFAULT_ATTACK_SANDBOX_DIR`（demo 未上传攻击样本时的默认目录）
 - `MA_MEMIDS_DEFAULT_BENIGN_SANDBOX_DIR`（demo 未上传正常样本时的默认目录）
 - `MA_MEMIDS_SCORE_IMPROVE_EPSILON`（全规则集对比的最小提升容差，默认 `1e-6`）
+- `MA_MEMIDS_PCAP_MAX_PACKETS` / `MA_MEMIDS_PCAP_MAX_PAYLOAD_BYTES`（PCAP 解析的限包与 payload 预览上限）
 
 也支持通过命令行覆盖模型：
 
@@ -179,6 +185,18 @@ python main.py \
 - `discarded_features`
 
 ATT&CK 和 CVE 虽然原始格式不同，但进入检索层后共用同一套 `Sparse + Dense + RRF` 搜索逻辑。
+若规则本身包含 `reference:*`：
+
+- `reference:cve,...`、显式 `Txxxx` 等结构化线索会直接进入可信证据集合
+- `reference:url,...` 会先进入独立 `Reference Resolver`，抓取网页并抽取 `trusted_cve_ids / trusted_tech_ids / trusted_terms / reference_summary`
+- `ReferenceParse LLM` 只在“文本页且 heuristic 未直接抽到 `CVE / ATT&CK ID`，并且页面长度达到阈值”时才触发，避免普通网页一律进 LLM
+- 初始化时会先对全部规则的 `reference:*` 做一轮有界并发预抓取，再按原顺序串行构建 Note；默认并发度为 `4`
+- 若 `reference:url,...` 没写协议头，系统会自动补全，优先尝试 `https://`，必要时回退 `http://`
+- 页面抓取失败、403/404、超时、内容过大或解析异常时，不会中断 init；系统会回退到结构化 reference + 当前 Hybrid Retrieval 主流程
+- 网页解析缓存默认存放在 `memory/reference_cache`，并会自动清理：默认保留 14 天、最多 2000 个文件、总大小最多 256MB
+- 如需调整，可设置 `MA_MEMIDS_REFERENCE_CACHE_MAX_AGE_DAYS`、`MA_MEMIDS_REFERENCE_CACHE_MAX_FILES`、`MA_MEMIDS_REFERENCE_CACHE_MAX_SIZE_BYTES`、`MA_MEMIDS_REFERENCE_MAX_WORKERS`、`MA_MEMIDS_REFERENCE_LLM_MIN_TEXT_CHARS`
+- 对 reference 给出的可信 CVE / ATT&CK ID，检索层会在 CVE / ATT&CK 索引中做 exact pin，避免普通双路检索把高可信人工参考覆盖掉
+
 下载地址：
 ATT&CK：https://github.com/mitre/cti/releases
 CVE：https://github.com/CVEProject/cvelistV5/releases
