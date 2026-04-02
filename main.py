@@ -14,6 +14,12 @@ except ImportError:
         return False
 
 from ma_memids.pipeline import MAMemIDSPipeline
+from ma_memids.embedding import SentenceTransformerEmbedder
+from ma_memids.knowledge import (
+    DualPathRetriever,
+    load_knowledge_source_registry,
+    save_knowledge_source_registry,
+)
 
 
 def _split_csv(value: str) -> List[str]:
@@ -28,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cve-kb", default="", help="CVE knowledge file or directory path")
     parser.add_argument("--attack-kb", default="", help="ATT&CK knowledge file or directory path")
     parser.add_argument("--cti-kb", default="", help="CTI knowledge file or directory path")
+    parser.add_argument("--knowledge-cache-dir", default="./memory/knowledge_cache", help="Knowledge cache directory")
+    parser.add_argument(
+        "--knowledge-prebuilt-only",
+        action="store_true",
+        help="Require prebuilt knowledge cache and forbid on-the-fly index building",
+    )
     parser.add_argument("--model", default=None, help="LLM model name from env configuration")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
 
@@ -49,8 +61,39 @@ def build_parser() -> argparse.ArgumentParser:
     export_cmd = sub.add_parser("export", help="Export current ruleset")
     export_cmd.add_argument("--output", default="./output/rules.rules", help="Output rules path")
 
+    sub.add_parser("build-knowledge", help="Prebuild hybrid knowledge caches only")
     sub.add_parser("stats", help="Show state statistics")
     return parser
+
+
+def _knowledge_progress_logger(payload: dict[str, object]) -> None:
+    event = str(payload.get("event") or "")
+    source = str(payload.get("source") or "knowledge")
+    if event == "source_start":
+        logging.info("[%s] start: %s", source, payload.get("path"))
+    elif event == "cache_reuse":
+        logging.info("[%s] reuse cache: docs=%s path=%s", source, payload.get("doc_count"), payload.get("path"))
+    elif event == "source_done":
+        logging.info("[%s] done: docs=%s path=%s", source, payload.get("doc_count"), payload.get("path"))
+    elif event == "stage":
+        logging.info("[%s] %s", source, payload.get("message"))
+    elif event == "progress_start":
+        logging.info(
+            "[%s] %s start: total=%s unit=%s",
+            source,
+            payload.get("stage"),
+            payload.get("total"),
+            payload.get("unit") or "it",
+        )
+    elif event == "progress_update":
+        logging.debug(
+            "[%s] %s progress: +%s",
+            source,
+            payload.get("stage"),
+            payload.get("advance"),
+        )
+    elif event == "progress_end":
+        logging.info("[%s] %s done: total=%s", source, payload.get("stage"), payload.get("total"))
 
 
 def main() -> None:
@@ -63,13 +106,60 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    if args.command == "build-knowledge":
+        if not any((args.cve_kb, args.attack_kb, args.cti_kb)):
+            parser.error("build-knowledge requires at least one of --cve-kb / --attack-kb / --cti-kb")
+        cache_dir = Path(args.knowledge_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        embedder = SentenceTransformerEmbedder()
+        retriever = DualPathRetriever(embedder=embedder, cache_dir=str(cache_dir))
+        retriever.load_knowledge(
+            cve_path=args.cve_kb or None,
+            attack_path=args.attack_kb or None,
+            cti_path=args.cti_kb or None,
+            progress_callback=_knowledge_progress_logger,
+            build_if_missing=True,
+        )
+        registry_path = save_knowledge_source_registry(
+            cache_dir,
+            cve_path=args.cve_kb or None,
+            attack_path=args.attack_kb or None,
+            cti_path=args.cti_kb or None,
+        )
+        logging.info("Knowledge source registry updated: %s", registry_path)
+        print(json.dumps(retriever.stats(), ensure_ascii=False, indent=2))
+        return
+
+    registry_used = False
+    if not any((args.cve_kb, args.attack_kb, args.cti_kb)):
+        registry_sources = load_knowledge_source_registry(args.knowledge_cache_dir)
+        if any(registry_sources.values()):
+            args.cve_kb = registry_sources.get("cve") or ""
+            args.attack_kb = registry_sources.get("attack") or ""
+            args.cti_kb = registry_sources.get("cti") or ""
+            registry_used = True
+            logging.info(
+                "Using knowledge sources from cache registry under %s: cve=%s attack=%s cti=%s",
+                Path(args.knowledge_cache_dir).expanduser(),
+                args.cve_kb or "-",
+                args.attack_kb or "-",
+                args.cti_kb or "-",
+            )
+
+    knowledge_build_if_missing = not args.knowledge_prebuilt_only
+    if registry_used and not args.knowledge_prebuilt_only:
+        knowledge_build_if_missing = False
+        logging.info("Knowledge sources were inferred from cache registry; running in prebuilt-cache mode by default")
+
     pipeline = MAMemIDSPipeline(
         state_path=args.state,
         llm_model=args.model,
         cve_knowledge_path=args.cve_kb or None,
         attack_knowledge_path=args.attack_kb or None,
         cti_knowledge_path=args.cti_kb or None,
+        knowledge_cache_dir=args.knowledge_cache_dir,
         validation_mode="strict",
+        knowledge_build_if_missing=knowledge_build_if_missing,
     )
 
     if args.command == "init":

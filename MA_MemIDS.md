@@ -137,6 +137,11 @@ $$
 
 当前工程不会对这些知识源做实时在线查询，而是统一预处理为本地标准文档，再走同一套 `Sparse + Dense + RRF` 检索逻辑。Dense 向量默认用 `sentence-transformers/all-MiniLM-L6-v2`，并可选加载 HNSW 作为加速索引。
 
+工程上支持两种运行方式：
+
+- 默认模式：`init/process` 首次遇到知识源时自动预处理并写入 `memory/knowledge_cache`，后续复用缓存
+- 两阶段模式：先单独执行 `build-knowledge` 预构建缓存。该步骤会把本次知识源路径写入 `memory/knowledge_cache/source_registry.json`。后续若 `init/process/stats` 未显式传 `--cve-kb/--attack-kb/--cti-kb`，系统会自动读取这份 registry 并默认以“只读预构建缓存”方式运行；也可继续显式加 `--knowledge-prebuilt-only` 强制只读缓存
+
 #### 双路检索流程
 
 ```

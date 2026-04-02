@@ -23,6 +23,7 @@ except ImportError:
         return False
 
 from ma_memids.llm_client import BaseLLMClient, create_llm_client
+from ma_memids.knowledge import load_knowledge_source_registry
 from ma_memids.pipeline import MAMemIDSPipeline
 
 
@@ -34,6 +35,7 @@ DEFAULT_RULES_PATH = ROOT / "rules"
 DEFAULT_SANDBOX_ROOT = ROOT / "sandbox_samples"
 DEFAULT_ATTACK_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "attack"
 DEFAULT_BENIGN_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "benign"
+DEFAULT_KNOWLEDGE_CACHE_DIR = ROOT / "memory" / "knowledge_cache"
 
 MAX_JOB_EVENTS = 1200
 MAX_JOBS = 120
@@ -122,9 +124,34 @@ class TracingLLMClient(BaseLLMClient):
 def create_pipeline_with_trace(llm_calls: List[Dict[str, Any]], llm_model: Optional[str] = None) -> MAMemIDSPipeline:
     base_client = create_llm_client(model=llm_model)
     tracing_client = TracingLLMClient(base_client, llm_calls)
+    knowledge_cache_dir = _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
+    registry_sources = load_knowledge_source_registry(knowledge_cache_dir)
+    cve_kb = registry_sources.get("cve") or (os.getenv("MA_MEMIDS_DEFAULT_CVE_KB") or "").strip()
+    attack_kb = registry_sources.get("attack") or (os.getenv("MA_MEMIDS_DEFAULT_ATTACK_KB") or "").strip()
+    cti_kb = registry_sources.get("cti") or (os.getenv("MA_MEMIDS_DEFAULT_CTI_KB") or "").strip()
+    registry_used = any(registry_sources.values())
+    knowledge_build_if_missing = not registry_used
+    if registry_used:
+        LOGGER.info(
+            "demo pipeline using knowledge registry from %s: cve=%s attack=%s cti=%s",
+            knowledge_cache_dir,
+            cve_kb or "-",
+            attack_kb or "-",
+            cti_kb or "-",
+        )
+    else:
+        LOGGER.info(
+            "demo pipeline knowledge registry missing under %s; falling back to default knowledge loading",
+            knowledge_cache_dir,
+        )
     return MAMemIDSPipeline(
         state_path=str(STATE_PATH),
         llm_client=tracing_client,
+        cve_knowledge_path=cve_kb or None,
+        attack_knowledge_path=attack_kb or None,
+        cti_knowledge_path=cti_kb or None,
+        knowledge_cache_dir=str(knowledge_cache_dir),
+        knowledge_build_if_missing=knowledge_build_if_missing,
     )
 
 

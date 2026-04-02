@@ -28,6 +28,18 @@ python main.py init --rules /path/to/base.rules
 # 阶段一：从规则目录初始化（可限制数量）
 python main.py init --rules /mnt/8T/xgr/zhuyijia/MA_MemIDS/rules --max-rules 200
 
+# 可选：先单独预构建知识索引，再在 init/process 时只读缓存
+python main.py \
+  --attack-kb ./knowledge/cti-ATT-CK-v18.1 \
+  --cve-kb ./knowledge/cves \
+  build-knowledge
+
+# 之后可直接复用上一次预构建登记的知识源，不必重复写三条 --*-kb
+python main.py init --rules /path/to/base.rules
+
+# 若你想显式强制“只读缓存，不允许现场重建”，再加这一项
+python main.py --knowledge-prebuilt-only init --rules /path/to/base.rules
+
 # 阶段二：处理未匹配流量
 python main.py process --pcap /path/to/sample.pcap --attack-pcaps /path/to/sample.pcap
 
@@ -41,7 +53,7 @@ python main.py export --output ./output/rules.rules
 
 ```text
 MA_MemIDS/
-├── main.py                      # CLI 入口：init/process/export/stats
+├── main.py                      # CLI 入口：init/process/export/build-knowledge/stats
 ├── self_check.py                # 一键自检：模块/API/验证器/流程烟测
 ├── MA_MemIDS.md                 # 你的方案文档（理论设计主来源）
 ├── requirements.txt             # 依赖
@@ -208,6 +220,27 @@ python scripts/build_knowledge_index.py \
   --attack-kb ./knowledge/cti-ATT-CK-v18.1 \
   --cve-kb ./knowledge/cves
 ```
+
+如果你希望把“构建索引”和“运行检索”彻底拆成两个步骤，也可以直接用主 CLI：
+
+```bash
+python main.py \
+  --attack-kb ./knowledge/cti-ATT-CK-v18.1 \
+  --cve-kb ./knowledge/cves \
+  --cti-kb ./knowledge/cti.jsonl \
+  build-knowledge
+
+python main.py init --rules /path/to/base.rules
+```
+
+此时：
+
+- `build-knowledge` 只负责标准化文档、构建 SQLite/BM25、Dense 向量缓存和可选 HNSW
+- `build-knowledge` 会把本次使用的知识源路径写入 `memory/knowledge_cache/source_registry.json`
+- 后续 `init/process/stats` 若未显式传 `--cve-kb/--attack-kb/--cti-kb`，会自动使用这份 registry 中登记的路径
+- 通过 registry 自动推断知识源时，运行默认进入“只读预构建缓存”模式，不会现场重建
+- `--knowledge-prebuilt-only` 仍可显式开启，强制 `init/process/stats` 只打开已有缓存，不允许现场重建
+- 若缓存缺失、源数据变更导致 manifest 不匹配、或你显式要求重建，运行会直接报错并提示先执行预构建
 
 ### 5.3 Embedding 模型
 

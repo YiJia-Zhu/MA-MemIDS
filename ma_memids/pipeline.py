@@ -30,9 +30,11 @@ class MAMemIDSPipeline:
         cve_knowledge_path: Optional[str] = None,
         attack_knowledge_path: Optional[str] = None,
         cti_knowledge_path: Optional[str] = None,
+        knowledge_cache_dir: Optional[str] = None,
         suricata_path: str = "/usr/bin/suricata",
         suricata_config: str = "/etc/suricata/suricata.yaml",
         validation_mode: str = "strict",
+        knowledge_build_if_missing: bool = True,
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,11 +44,12 @@ class MAMemIDSPipeline:
         self.weights = SimilarityWeights()
 
         self.embedder = SentenceTransformerEmbedder(model_name=self.runtime.embedding_model)
-        self.retriever = DualPathRetriever(embedder=self.embedder)
+        self.retriever = DualPathRetriever(embedder=self.embedder, cache_dir=knowledge_cache_dir)
         self.retriever.load_knowledge(
             cve_path=cve_knowledge_path,
             attack_path=attack_knowledge_path,
             cti_path=cti_knowledge_path,
+            build_if_missing=knowledge_build_if_missing,
         )
 
         self.llm = llm_client or create_llm_client(model=llm_model)

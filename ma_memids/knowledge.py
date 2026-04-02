@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - optional dependency guard
 from .config import RuntimeConfig
 from .embedding import SentenceTransformerEmbedder
 from .models import EnrichedKnowledge, ExternalDoc, RetrievalPlan, RetrievedItem
-from .utils import dedupe_keep_order
+from .utils import dedupe_keep_order, now_iso
 
 
 LOGGER = logging.getLogger(__name__)
@@ -34,6 +34,7 @@ EMBED_BATCH_SIZE = 128
 SQLITE_TIMEOUT = 60.0
 PROGRESS_FILE_BATCH = 100
 PROGRESS_DOC_BATCH = 256
+SOURCE_REGISTRY_FILENAME = "source_registry.json"
 ProgressCallback = Callable[[Dict[str, object]], None]
 
 
@@ -79,6 +80,52 @@ class CacheSpec:
     hnsw_path: Path
 
 
+def knowledge_source_registry_path(cache_root: Path | str) -> Path:
+    return Path(cache_root).expanduser() / SOURCE_REGISTRY_FILENAME
+
+
+def load_knowledge_source_registry(cache_root: Path | str) -> Dict[str, str]:
+    path = knowledge_source_registry_path(cache_root)
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    sources = raw.get("sources") if isinstance(raw.get("sources"), dict) else raw
+    if not isinstance(sources, dict):
+        return {}
+    return {
+        "cve": str(sources.get("cve") or "").strip(),
+        "attack": str(sources.get("attack") or "").strip(),
+        "cti": str(sources.get("cti") or "").strip(),
+    }
+
+
+def save_knowledge_source_registry(
+    cache_root: Path | str,
+    *,
+    cve_path: Optional[str] = None,
+    attack_path: Optional[str] = None,
+    cti_path: Optional[str] = None,
+) -> Path:
+    cache_dir = Path(cache_root).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": now_iso(),
+        "sources": {
+            "cve": str(Path(cve_path).expanduser().resolve()) if cve_path else "",
+            "attack": str(Path(attack_path).expanduser().resolve()) if attack_path else "",
+            "cti": str(Path(cti_path).expanduser().resolve()) if cti_path else "",
+        },
+    }
+    path = knowledge_source_registry_path(cache_dir)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 class KnowledgeSourceIndex:
     def __init__(
         self,
@@ -122,6 +169,7 @@ class KnowledgeSourceIndex:
         dense_k: int,
         rrf_k: int,
         progress_callback: Optional[ProgressCallback] = None,
+        build_if_missing: bool = True,
     ) -> "KnowledgeSourceIndex":
         index = cls(
             source=source,
@@ -132,7 +180,11 @@ class KnowledgeSourceIndex:
             dense_k=dense_k,
             rrf_k=rrf_k,
         )
-        index._load_or_build_from_path(Path(path), progress_callback=progress_callback)
+        index._load_or_build_from_path(
+            Path(path),
+            progress_callback=progress_callback,
+            build_if_missing=build_if_missing,
+        )
         return index
 
     @classmethod
@@ -243,7 +295,12 @@ class KnowledgeSourceIndex:
         }
         return items, debug
 
-    def _load_or_build_from_path(self, path: Path, progress_callback: Optional[ProgressCallback] = None) -> None:
+    def _load_or_build_from_path(
+        self,
+        path: Path,
+        progress_callback: Optional[ProgressCallback] = None,
+        build_if_missing: bool = True,
+    ) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Knowledge path not found: {path}")
 
@@ -265,7 +322,30 @@ class KnowledgeSourceIndex:
         }
 
         force_rebuild = (os.getenv("MA_MEMIDS_REBUILD_KNOWLEDGE_INDEX") or "").strip().lower() in {"1", "true", "yes", "on"}
-        if force_rebuild or not manifest or any(manifest.get(key) != value for key, value in expected.items()):
+        manifest_mismatch_keys = [key for key, value in expected.items() if manifest is None or manifest.get(key) != value]
+        cache_files_ready = (
+            manifest is not None
+            and cache_spec.db_path.exists()
+            and cache_spec.dense_path.exists()
+        )
+        rebuild_required = force_rebuild or (not cache_files_ready) or bool(manifest_mismatch_keys)
+
+        if rebuild_required:
+            if not build_if_missing:
+                if force_rebuild:
+                    reason = "forced_rebuild_requested"
+                elif manifest is None:
+                    reason = "cache_manifest_missing"
+                elif not cache_files_ready:
+                    reason = "cache_files_missing"
+                else:
+                    reason = f"cache_stale:{','.join(manifest_mismatch_keys)}"
+                raise RuntimeError(
+                    f"Prebuilt knowledge cache required for {self.source} from {path.resolve()} but {reason}. "
+                    f"Expected cache under {cache_spec.cache_dir}. "
+                    "Run `python main.py --attack-kb ... --cve-kb ... --cti-kb ... build-knowledge` "
+                    "or `python scripts/build_knowledge_index.py ...` first."
+                )
             LOGGER.info("Building knowledge cache for %s from %s", self.source, path)
             _emit_progress(progress_callback, event="stage", source=self.source, stage="normalize", message="Normalizing source documents")
             normalized = list(self._iter_normalized_docs(path, progress_callback=progress_callback))
@@ -812,6 +892,7 @@ class DualPathRetriever:
         attack_path: Optional[str] = None,
         cti_path: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
+        build_if_missing: bool = True,
     ) -> None:
         if cve_path:
             self._indexes["cve"] = KnowledgeSourceIndex.from_path(
@@ -824,6 +905,7 @@ class DualPathRetriever:
                 dense_k=self.dense_k,
                 rrf_k=self.rrf_k,
                 progress_callback=progress_callback,
+                build_if_missing=build_if_missing,
             )
         if attack_path:
             self._indexes["attack"] = KnowledgeSourceIndex.from_path(
@@ -836,6 +918,7 @@ class DualPathRetriever:
                 dense_k=self.dense_k,
                 rrf_k=self.rrf_k,
                 progress_callback=progress_callback,
+                build_if_missing=build_if_missing,
             )
         if cti_path:
             self._indexes["cti"] = KnowledgeSourceIndex.from_path(
@@ -848,6 +931,7 @@ class DualPathRetriever:
                 dense_k=self.dense_k,
                 rrf_k=self.rrf_k,
                 progress_callback=progress_callback,
+                build_if_missing=build_if_missing,
             )
 
     def retrieve(self, text: str, plan: Optional[RetrievalPlan] = None) -> EnrichedKnowledge:

@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ma_memids.embedding import SentenceTransformerEmbedder
-from ma_memids.knowledge import DualPathRetriever
+from ma_memids.knowledge import DualPathRetriever, save_knowledge_source_registry
 
 
 class BuildProgressReporter:
@@ -96,6 +96,13 @@ def main() -> None:
         )
     finally:
         reporter.close()
+    registry_path = save_knowledge_source_registry(
+        cache_dir,
+        cve_path=args.cve_kb or None,
+        attack_path=args.attack_kb or None,
+        cti_path=args.cti_kb or None,
+    )
+    print(f"knowledge source registry: {registry_path}")
     print(json.dumps(retriever.stats(), ensure_ascii=False, indent=2))
 
 
