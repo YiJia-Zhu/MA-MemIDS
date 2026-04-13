@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import shutil
@@ -22,6 +23,7 @@ except ImportError:
     def load_dotenv(*args: Any, **kwargs: Any) -> bool:
         return False
 
+from ma_memids.graph import NoteGraph
 from ma_memids.llm_client import BaseLLMClient, create_llm_client
 from ma_memids.knowledge import load_knowledge_source_registry
 from ma_memids.pipeline import MAMemIDSPipeline
@@ -42,6 +44,20 @@ MAX_JOBS = 120
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+STATE_SNAPSHOT_LOCK = threading.Lock()
+STATE_SNAPSHOT_CACHE: Dict[str, Any] = {
+    "graph": None,
+    "raw": None,
+    "mtime_ns": None,
+}
+PIPELINE_CACHE_LOCK = threading.Condition(threading.Lock())
+PIPELINE_CACHE: Dict[str, Any] = {
+    "pipeline": None,
+    "cache_key": None,
+    "state_mtime_ns": None,
+    "building": False,
+    "error": None,
+}
 
 
 def _configure_logging() -> logging.Logger:
@@ -121,9 +137,7 @@ class TracingLLMClient(BaseLLMClient):
         return self.inner.model_name()
 
 
-def create_pipeline_with_trace(llm_calls: List[Dict[str, Any]], llm_model: Optional[str] = None) -> MAMemIDSPipeline:
-    base_client = create_llm_client(model=llm_model)
-    tracing_client = TracingLLMClient(base_client, llm_calls)
+def _resolve_pipeline_setup() -> Dict[str, Any]:
     knowledge_cache_dir = _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
     registry_sources = load_knowledge_source_registry(knowledge_cache_dir)
     cve_kb = registry_sources.get("cve") or (os.getenv("MA_MEMIDS_DEFAULT_CVE_KB") or "").strip()
@@ -131,28 +145,204 @@ def create_pipeline_with_trace(llm_calls: List[Dict[str, Any]], llm_model: Optio
     cti_kb = registry_sources.get("cti") or (os.getenv("MA_MEMIDS_DEFAULT_CTI_KB") or "").strip()
     registry_used = any(registry_sources.values())
     knowledge_build_if_missing = not registry_used
-    if registry_used:
+    return {
+        "knowledge_cache_dir": knowledge_cache_dir,
+        "cve_kb": cve_kb,
+        "attack_kb": attack_kb,
+        "cti_kb": cti_kb,
+        "registry_used": registry_used,
+        "knowledge_build_if_missing": knowledge_build_if_missing,
+    }
+
+
+def _log_pipeline_setup(setup: Dict[str, Any], *, context: str) -> None:
+    if setup["registry_used"]:
         LOGGER.info(
-            "demo pipeline using knowledge registry from %s: cve=%s attack=%s cti=%s",
-            knowledge_cache_dir,
-            cve_kb or "-",
-            attack_kb or "-",
-            cti_kb or "-",
+            "%s using knowledge registry from %s: cve=%s attack=%s cti=%s",
+            context,
+            setup["knowledge_cache_dir"],
+            setup["cve_kb"] or "-",
+            setup["attack_kb"] or "-",
+            setup["cti_kb"] or "-",
         )
     else:
         LOGGER.info(
-            "demo pipeline knowledge registry missing under %s; falling back to default knowledge loading",
-            knowledge_cache_dir,
+            "%s knowledge registry missing under %s; falling back to default knowledge loading",
+            context,
+            setup["knowledge_cache_dir"],
         )
+
+
+def _build_pipeline(
+    *,
+    llm_client: Optional[BaseLLMClient] = None,
+    llm_model: Optional[str] = None,
+    context: str,
+) -> MAMemIDSPipeline:
+    setup = _resolve_pipeline_setup()
+    _log_pipeline_setup(setup, context=context)
     return MAMemIDSPipeline(
         state_path=str(STATE_PATH),
-        llm_client=tracing_client,
-        cve_knowledge_path=cve_kb or None,
-        attack_knowledge_path=attack_kb or None,
-        cti_knowledge_path=cti_kb or None,
-        knowledge_cache_dir=str(knowledge_cache_dir),
-        knowledge_build_if_missing=knowledge_build_if_missing,
+        llm_client=llm_client,
+        llm_model=(None if llm_client is not None else llm_model),
+        cve_knowledge_path=setup["cve_kb"] or None,
+        attack_knowledge_path=setup["attack_kb"] or None,
+        cti_knowledge_path=setup["cti_kb"] or None,
+        knowledge_cache_dir=str(setup["knowledge_cache_dir"]),
+        knowledge_build_if_missing=setup["knowledge_build_if_missing"],
     )
+
+
+def create_pipeline_with_trace(llm_calls: List[Dict[str, Any]], llm_model: Optional[str] = None) -> MAMemIDSPipeline:
+    base_client = create_llm_client(model=llm_model)
+    tracing_client = TracingLLMClient(base_client, llm_calls)
+    return _build_pipeline(llm_client=tracing_client, context="demo pipeline")
+
+
+def _shared_pipeline_cache_key() -> tuple[str, str, str, str]:
+    setup = _resolve_pipeline_setup()
+    return (
+        str(setup["knowledge_cache_dir"]),
+        str(setup["cve_kb"] or ""),
+        str(setup["attack_kb"] or ""),
+        str(setup["cti_kb"] or ""),
+    )
+
+
+def _current_state_mtime_ns() -> Optional[int]:
+    if not STATE_PATH.exists():
+        return None
+    return STATE_PATH.stat().st_mtime_ns
+
+
+def _invalidate_state_snapshot(reason: str) -> None:
+    with STATE_SNAPSHOT_LOCK:
+        STATE_SNAPSHOT_CACHE["graph"] = None
+        STATE_SNAPSHOT_CACHE["raw"] = None
+        STATE_SNAPSHOT_CACHE["mtime_ns"] = None
+    LOGGER.info("demo state snapshot invalidated: %s", reason)
+
+
+def _get_state_snapshot() -> tuple[NoteGraph, Dict[str, Any]]:
+    state_mtime_ns = _current_state_mtime_ns()
+    with STATE_SNAPSHOT_LOCK:
+        if (
+            STATE_SNAPSHOT_CACHE["graph"] is not None
+            and STATE_SNAPSHOT_CACHE["raw"] is not None
+            and STATE_SNAPSHOT_CACHE["mtime_ns"] == state_mtime_ns
+        ):
+            return STATE_SNAPSHOT_CACHE["graph"], STATE_SNAPSHOT_CACHE["raw"]
+
+    if STATE_PATH.exists():
+        raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    else:
+        raw = {}
+    graph_data = raw.get("graph") if isinstance(raw, dict) else {}
+    graph = NoteGraph.from_dict(graph_data) if isinstance(graph_data, dict) else NoteGraph()
+
+    with STATE_SNAPSHOT_LOCK:
+        STATE_SNAPSHOT_CACHE["graph"] = graph
+        STATE_SNAPSHOT_CACHE["raw"] = raw
+        STATE_SNAPSHOT_CACHE["mtime_ns"] = state_mtime_ns
+    return graph, raw
+
+
+def _state_stats_payload(graph: NoteGraph, raw: Dict[str, Any]) -> Dict[str, Any]:
+    notes = graph.all_notes()
+    rule_notes = [n for n in notes if n.note_type == "rule"]
+    baseline = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
+    embedding = raw.get("embedding") if isinstance(raw, dict) else {}
+    return {
+        "total_notes": len(notes),
+        "rule_notes": len(rule_notes),
+        "traffic_notes": 0,
+        "llm_model": (os.getenv("LLM_MODEL") or "gpt-4.1").strip() or "gpt-4.1",
+        "embedding": embedding if isinstance(embedding, dict) else {},
+        "knowledge": {
+            "cache_dir": str(_resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))),
+            "sources": load_knowledge_source_registry(
+                _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
+            ),
+        },
+        "thresholds": graph.thresholds.__dict__,
+        "graph_index": graph.index_stats(),
+        "sandbox_baseline": baseline if isinstance(baseline, dict) else {},
+    }
+
+
+def _invalidate_shared_pipeline(reason: str) -> None:
+    _invalidate_state_snapshot(reason)
+    with PIPELINE_CACHE_LOCK:
+        PIPELINE_CACHE["pipeline"] = None
+        PIPELINE_CACHE["cache_key"] = None
+        PIPELINE_CACHE["state_mtime_ns"] = None
+        PIPELINE_CACHE["error"] = None
+        PIPELINE_CACHE_LOCK.notify_all()
+    LOGGER.info("shared demo pipeline invalidated: %s", reason)
+
+
+def _get_shared_pipeline() -> MAMemIDSPipeline:
+    cache_key = _shared_pipeline_cache_key()
+    state_mtime_ns = _current_state_mtime_ns()
+
+    with PIPELINE_CACHE_LOCK:
+        while PIPELINE_CACHE["building"]:
+            if (
+                PIPELINE_CACHE["pipeline"] is not None
+                and PIPELINE_CACHE["cache_key"] == cache_key
+                and PIPELINE_CACHE["state_mtime_ns"] == state_mtime_ns
+            ):
+                return PIPELINE_CACHE["pipeline"]
+            PIPELINE_CACHE_LOCK.wait()
+
+        if (
+            PIPELINE_CACHE["pipeline"] is not None
+            and PIPELINE_CACHE["cache_key"] == cache_key
+            and PIPELINE_CACHE["state_mtime_ns"] == state_mtime_ns
+        ):
+            return PIPELINE_CACHE["pipeline"]
+
+        PIPELINE_CACHE["building"] = True
+        PIPELINE_CACHE["error"] = None
+
+    t0 = time.time()
+    try:
+        pipeline = _build_pipeline(context="shared demo pipeline")
+        pipeline.stats()
+    except Exception as exc:
+        with PIPELINE_CACHE_LOCK:
+            PIPELINE_CACHE["building"] = False
+            PIPELINE_CACHE["error"] = exc
+            PIPELINE_CACHE_LOCK.notify_all()
+        raise
+
+    dt = time.time() - t0
+    with PIPELINE_CACHE_LOCK:
+        PIPELINE_CACHE["pipeline"] = pipeline
+        PIPELINE_CACHE["cache_key"] = cache_key
+        PIPELINE_CACHE["state_mtime_ns"] = state_mtime_ns
+        PIPELINE_CACHE["building"] = False
+        PIPELINE_CACHE["error"] = None
+        PIPELINE_CACHE_LOCK.notify_all()
+    LOGGER.info("shared demo pipeline ready in %.3fs", dt)
+    return pipeline
+
+
+def _warm_shared_pipeline(reason: str) -> None:
+    try:
+        LOGGER.info("shared demo pipeline warmup start: %s", reason)
+        _get_shared_pipeline()
+    except Exception:
+        LOGGER.exception("shared demo pipeline warmup failed: %s", reason)
+
+
+def _schedule_shared_pipeline_warmup(reason: str) -> None:
+    threading.Thread(
+        target=_warm_shared_pipeline,
+        args=(reason,),
+        daemon=True,
+        name=f"demo-pipeline-warmup-{reason}",
+    ).start()
 
 
 def _now_iso() -> str:
@@ -453,6 +643,7 @@ def _run_init_payload(
         max_rules=init_args["max_rules"],
         progress_callback=progress_callback,
     )
+    _invalidate_shared_pipeline("init_complete")
     return {
         "ok": True,
         "initialized_rules": count,
@@ -478,6 +669,7 @@ def _run_process_payload(
         human_override=process_args["human_override"],
         progress_callback=progress_callback,
     )
+    _invalidate_shared_pipeline("process_complete")
     trace_steps = (((outcome or {}).get("trace") or {}).get("steps") or [])
     resolved_step = next((s for s in trace_steps if s.get("name") == "sandbox_dataset_resolved"), None)
     label_step = next((s for s in trace_steps if s.get("name") == "analyzed_pcap_labeling"), None)
@@ -594,8 +786,7 @@ def root() -> Any:
 
 @app.get("/api/status")
 def api_status() -> Any:
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
+    graph, raw = _get_state_snapshot()
     default_attack_dir = os.getenv("MA_MEMIDS_DEFAULT_ATTACK_SANDBOX_DIR", str(DEFAULT_ATTACK_SANDBOX_DIR))
     default_benign_dir = os.getenv("MA_MEMIDS_DEFAULT_BENIGN_SANDBOX_DIR", str(DEFAULT_BENIGN_SANDBOX_DIR))
     default_attack_pcaps = _collect_pcap_files(default_attack_dir)
@@ -605,7 +796,7 @@ def api_status() -> Any:
     return jsonify(
         {
             "ok": True,
-            "stats": pipeline.stats(),
+            "stats": _state_stats_payload(graph, raw),
             "state_path": str(STATE_PATH),
             "default_rules_path": _display_app_path(
                 os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH))
@@ -623,9 +814,8 @@ def api_status() -> Any:
 
 @app.get("/api/graph/summary")
 def api_graph_summary() -> Any:
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
-    notes = pipeline.graph.all_notes()
+    graph, _ = _get_state_snapshot()
+    notes = graph.all_notes()
     rule_notes = [n for n in notes if n.note_type == "rule"]
     total_links = sum(len(n.links) for n in notes)
     latest_notes = sorted(notes, key=lambda n: n.timestamp, reverse=True)[:10]
@@ -657,9 +847,7 @@ def api_graph_view() -> Any:
     keyword = (request.args.get("q") or "").strip().lower()
     center_note_id = (request.args.get("note_id") or "").strip()
 
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
-    graph = pipeline.graph
+    graph, _ = _get_state_snapshot()
     notes = sorted(graph.all_notes(), key=lambda n: n.timestamp, reverse=True)
 
     def _match_type(note: Any) -> bool:
@@ -790,9 +978,8 @@ def api_graph_notes() -> Any:
     note_type = (request.args.get("note_type") or "").strip().lower()
     keyword = (request.args.get("q") or "").strip().lower()
 
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
-    notes = pipeline.graph.all_notes()
+    graph, _ = _get_state_snapshot()
+    notes = graph.all_notes()
 
     if note_type not in {"", "rule"}:
         return jsonify({"ok": False, "error": "note_type must be one of: rule"}), 400
@@ -833,9 +1020,8 @@ def api_graph_notes() -> Any:
 
 @app.get("/api/graph/note/<note_id>")
 def api_graph_note_detail(note_id: str) -> Any:
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
-    note = pipeline.graph.get(note_id)
+    graph, _ = _get_state_snapshot()
+    note = graph.get(note_id)
     if note is None:
         return jsonify({"ok": False, "error": f"note not found: {note_id}"}), 404
     return jsonify({"ok": True, "note": note.to_dict()})
@@ -848,9 +1034,8 @@ def api_graph_clear() -> Any:
     if confirm != "CLEAR":
         return jsonify({"ok": False, "error": "confirmation required: set confirm=CLEAR"}), 400
 
-    llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls)
-    before = pipeline.stats()
+    graph, raw = _get_state_snapshot()
+    before = _state_stats_payload(graph, raw)
 
     backup_path = None
     if STATE_PATH.exists():
@@ -859,9 +1044,12 @@ def api_graph_clear() -> Any:
         shutil.copy2(STATE_PATH, backup_file)
         backup_path = str(backup_file)
 
-    pipeline.graph.notes.clear()
-    pipeline.save_state()
-    after = pipeline.stats()
+    graph.notes.clear()
+    state_payload = dict(raw) if isinstance(raw, dict) else {}
+    state_payload["graph"] = graph.to_dict()
+    STATE_PATH.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _invalidate_shared_pipeline("graph_clear")
+    after = _state_stats_payload(graph, state_payload)
 
     return jsonify(
         {

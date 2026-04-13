@@ -774,6 +774,10 @@ window.addEventListener('resize', () => {
   }, 140);
 });
 
-fetchStatus();
-fetchGraphSummary();
-fetchGraphView(document.getElementById('graph-viz-form'));
+async function bootstrapPage() {
+  await fetchStatus();
+  await fetchGraphSummary();
+  await fetchGraphView(document.getElementById('graph-viz-form'));
+}
+
+bootstrapPage();
