@@ -4,9 +4,11 @@ __pycache__/
 .env
 memory/*
 output/rules.rules
-rules
+IDS_dataset
 knowledge/*
 huggingface_models/*
+output/*
+rules/*
 
 !huggingface_models/huggingface_download.sh
 !knowledge/.gitkeep

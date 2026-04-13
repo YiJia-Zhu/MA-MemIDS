@@ -54,7 +54,7 @@ class TrafficSummary:
     binary_payload_skipped: bool = False
 
     def to_text(self) -> str:
-        parts = [f"pcap={self.pcap_path}"]
+        parts = []
         if self.protocol:
             parts.append(f"protocol={self.protocol}")
         if self.src_ip and self.dst_ip:

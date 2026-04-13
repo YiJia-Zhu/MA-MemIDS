@@ -246,6 +246,42 @@ python main.py init --rules /path/to/base.rules
 
 当前默认 embedding 模型是 `sentence-transformers/all-MiniLM-L6-v2`，输出维度为 `384`。若仓库内存在 `./huggingface_models/all-MiniLM-L6-v2`，代码会优先直接从该本地目录加载；也可以通过 `MA_MEMIDS_EMBEDDING_MODEL_DIR` 指定本地模型目录。如无本地目录，才回退到 Hugging Face 名称加载。知识检索层会离线缓存 Dense 向量；若环境中可用 `hnswlib`，还会自动为知识库构建 HNSW 索引，否则回退为精确 Dense 扫描。
 
+### 5.4 当前实验数据与规则快照
+
+以下内容对应当前 `IDS_dataset/prepared/manifest.tsv` 与当前选中的 `rules/` 目录。
+
+当前纳入实验的 3 个数据集：
+
+- `CIC-IoT2023`：`216` 个样本
+- `SYRIUS`：`61` 个样本
+- `UNSW-NB15`：`141` 个样本
+
+当前 `prepared` 中涉及的攻击类别：
+
+- `CIC-IoT2023`：`backdoor_malware`、`browserhijacking`、`commandinjection`、`dictionarybruteforce`、`sqlinjection`、`uploading_attack`
+- `SYRIUS`：`jboss_htmladaptor_probe`、`coldfusion_admin_access`、`htaccess_access`、`iis_admin_access`、`xss_attempt`、`isapi_idq_exploit`、`system32_cmd_exec`，以及对应保留的原始聚合样本
+- `UNSW-NB15`：`exploits/browser`、`exploits/browser_ftp`、`exploits/clientside`、`exploits/clientside_microsoft`、`exploits/clientside_microsoft_media_player`、`exploits/clientside_microsoft_office`、`exploits/clientside_microsoft_paint`、`exploits/microsoft_iis`、`exploits/miscellaneous_batch`、`exploits/office_document`、`exploits/web_application`、`exploits/webserver`
+
+当前选中的规则文件名集合位于 `rules/`：
+
+- `BSD-License.txt`
+- `LICENSE`
+- `classification.config`
+- `compromised-ips.txt`
+- `emerging-activex.rules`
+- `emerging-exploit.rules`
+- `emerging-exploit_kit.rules`
+- `emerging-ftp.rules`
+- `emerging-malware.rules`
+- `emerging-shellcode.rules`
+- `emerging-sql.rules`
+- `emerging-web_client.rules`
+- `emerging-web_server.rules`
+- `emerging-web_specific_apps.rules`
+- `gpl-2.0.txt`
+- `sid-msg.map`
+- `suricata-5.0-enhanced-open.txt`
+
 ---
 
 ## 6. 自检（强烈建议先跑）
