@@ -32,11 +32,18 @@ COMMON_SERVICE_PORTS = {
 
 
 class NoteBuilder:
-    def __init__(self, retriever: DualPathRetriever, embedder: SentenceTransformerEmbedder, llm_client: BaseLLMClient):
+    def __init__(
+        self,
+        retriever: DualPathRetriever,
+        embedder: SentenceTransformerEmbedder,
+        llm_client: BaseLLMClient,
+        tool_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ):
         self.retriever = retriever
         self.embedder = embedder
         self.llm = llm_client
-        self.reference_resolver = ReferenceResolver(llm_client)
+        self.tool_callback = tool_callback
+        self.reference_resolver = ReferenceResolver(llm_client, tool_callback=tool_callback)
 
     def build_rule_note(
         self,
@@ -164,6 +171,7 @@ class NoteBuilder:
         parsed_rules: Iterable[Dict[str, object]],
         *,
         progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+        batch_result_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     ) -> List[Dict[str, object]]:
         prepared_rules = [dict(item) if isinstance(item, dict) else {} for item in parsed_rules]
         reference_batches = []
@@ -176,6 +184,7 @@ class NoteBuilder:
         return self.reference_resolver.resolve_reference_batches(
             reference_batches,
             progress_callback=progress_callback,
+            batch_result_callback=batch_result_callback,
         )
 
     def build_traffic_note(

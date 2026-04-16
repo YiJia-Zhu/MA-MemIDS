@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 HTTP_REQUEST_RE = re.compile(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+HTTP", re.IGNORECASE)
@@ -70,13 +70,17 @@ class TrafficSummary:
 
 class PCAPParser:
     @staticmethod
-    def parse(pcap_path: str) -> TrafficSummary:
+    def parse(pcap_path: str, tool_callback: Optional[Callable[[Dict[str, object]], None]] = None) -> TrafficSummary:
         if not os.path.exists(pcap_path):
             raise FileNotFoundError(f"PCAP not found: {pcap_path}")
         try:
-            return PCAPParser._parse_with_scapy(pcap_path)
+            summary = PCAPParser._parse_with_scapy(pcap_path)
+            PCAPParser._emit_tool_call(tool_callback, "parse_with_scapy", pcap_path, summary)
+            return summary
         except Exception:
-            return PCAPParser._parse_with_tshark(pcap_path)
+            summary = PCAPParser._parse_with_tshark(pcap_path, tool_callback=tool_callback)
+            PCAPParser._emit_tool_call(tool_callback, "parse_with_tshark", pcap_path, summary)
+            return summary
 
     @staticmethod
     def _parse_with_scapy(pcap_path: str) -> TrafficSummary:
@@ -115,7 +119,10 @@ class PCAPParser:
         return summary
 
     @staticmethod
-    def _parse_with_tshark(pcap_path: str) -> TrafficSummary:
+    def _parse_with_tshark(
+        pcap_path: str,
+        tool_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ) -> TrafficSummary:
         limits = PCAPParser._limits()
         summary = TrafficSummary(pcap_path=pcap_path, http_headers={}, parser_backend="tshark_stream")
         payload_preview = bytearray()
@@ -123,40 +130,53 @@ class PCAPParser:
 
         try:
             max_packets = limits["max_packets"] + 1
+            cmd = [
+                "tshark",
+                "-r",
+                pcap_path,
+                "-c",
+                str(max_packets),
+                "-T",
+                "fields",
+                "-e",
+                "ip.src",
+                "-e",
+                "ip.dst",
+                "-e",
+                "tcp.srcport",
+                "-e",
+                "tcp.dstport",
+                "-e",
+                "udp.srcport",
+                "-e",
+                "udp.dstport",
+                "-e",
+                "http.request.method",
+                "-e",
+                "http.request.uri",
+                "-e",
+                "tcp.payload",
+                "-e",
+                "udp.payload",
+            ]
             proc = subprocess.run(
-                [
-                    "tshark",
-                    "-r",
-                    pcap_path,
-                    "-c",
-                    str(max_packets),
-                    "-T",
-                    "fields",
-                    "-e",
-                    "ip.src",
-                    "-e",
-                    "ip.dst",
-                    "-e",
-                    "tcp.srcport",
-                    "-e",
-                    "tcp.dstport",
-                    "-e",
-                    "udp.srcport",
-                    "-e",
-                    "udp.dstport",
-                    "-e",
-                    "http.request.method",
-                    "-e",
-                    "http.request.uri",
-                    "-e",
-                    "tcp.payload",
-                    "-e",
-                    "udp.payload",
-                ],
+                cmd,
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=limits["tshark_timeout"],
+            )
+            PCAPParser._emit_tool_call(
+                tool_callback,
+                "tshark_subprocess",
+                pcap_path,
+                summary=None,
+                extra={
+                    "command": cmd,
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                },
             )
             lines = [line for line in proc.stdout.splitlines() if line.strip()]
             if len(lines) > limits["max_packets"]:
@@ -181,8 +201,55 @@ class PCAPParser:
             PCAPParser._finalize_payload_summary(summary, bytes(payload_preview), limits)
         except Exception as exc:
             summary.payload_text = f"parse_error={exc}"
+            PCAPParser._emit_tool_call(
+                tool_callback,
+                "tshark_subprocess",
+                pcap_path,
+                summary=None,
+                extra={"error": str(exc)},
+            )
 
         return summary
+
+    @staticmethod
+    def _emit_tool_call(
+        tool_callback: Optional[Callable[[Dict[str, object]], None]],
+        action: str,
+        pcap_path: str,
+        summary: Optional[TrafficSummary],
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if tool_callback is None:
+            return
+        output: Dict[str, object] = dict(extra or {})
+        if summary is not None:
+            output.update(
+                {
+                    "parser_backend": summary.parser_backend,
+                    "protocol": summary.protocol,
+                    "packets_seen": summary.packets_seen,
+                    "packets_sampled": summary.packets_sampled,
+                    "primary_flow": summary.primary_flow,
+                    "src_ip": summary.src_ip,
+                    "dst_ip": summary.dst_ip,
+                    "src_port": summary.src_port,
+                    "dst_port": summary.dst_port,
+                    "http_method": summary.http_method,
+                    "http_uri": summary.http_uri,
+                    "payload_text": summary.payload_text,
+                    "payload_bytes_seen": summary.payload_bytes_seen,
+                    "payload_bytes_kept": summary.payload_bytes_kept,
+                    "payload_truncated": summary.payload_truncated,
+                }
+            )
+        tool_callback(
+            {
+                "tool": "pcap_parser",
+                "action": action,
+                "input": {"pcap_path": pcap_path},
+                "output": output,
+            }
+        )
 
     @staticmethod
     def _packet_meta_from_scapy(pkt, *, IP, TCP, UDP, Raw) -> Optional[Dict[str, object]]:

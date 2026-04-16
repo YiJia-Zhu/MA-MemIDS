@@ -20,10 +20,12 @@ class SuricataValidator:
         suricata_path: str = "/usr/bin/suricata",
         suricata_config: str = "/etc/suricata/suricata.yaml",
         validation_mode: str = "strict",
+        tool_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.suricata_path = suricata_path
         self.suricata_config = suricata_config
         self.validation_mode = validation_mode
+        self.tool_callback = tool_callback
 
     def validate_rule_format(self, rule: str) -> Tuple[bool, Optional[str]]:
         return self.validate_ruleset_format([rule])
@@ -39,32 +41,52 @@ class SuricataValidator:
 
         try:
             with tempfile.TemporaryDirectory() as log_dir:
+                cmd = [
+                    self.suricata_path,
+                    "-T",
+                    "-S",
+                    rule_file,
+                    "-c",
+                    self.suricata_config,
+                    "-l",
+                    log_dir,
+                ]
                 proc = subprocess.run(
-                    [
-                        self.suricata_path,
-                        "-T",
-                        "-S",
-                        rule_file,
-                        "-c",
-                        self.suricata_config,
-                        "-l",
-                        log_dir,
-                    ],
+                    cmd,
                     check=False,
                     capture_output=True,
                     text=True,
                     timeout=60,
                 )
+            self._emit_tool_call(
+                "suricata_validate_format",
+                input_payload={"command": cmd, "rule_count": len(clean_rules)},
+                output_payload={
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                },
+            )
             if proc.returncode == 0:
                 return True, None
             return False, (proc.stderr or proc.stdout or "Suricata syntax error").strip()
         except FileNotFoundError:
+            self._emit_tool_call(
+                "suricata_validate_format",
+                input_payload={"rule_count": len(clean_rules), "mode": "basic_syntax_fallback"},
+                output_payload={"status": "suricata_missing"},
+            )
             for rule in clean_rules:
                 ok, err = self._basic_syntax_check(rule)
                 if not ok:
                     return False, err
             return True, None
         except subprocess.TimeoutExpired:
+            self._emit_tool_call(
+                "suricata_validate_format",
+                input_payload={"rule_count": len(clean_rules)},
+                error="Suricata format validation timeout",
+            )
             return False, "Suricata format validation timeout"
         finally:
             try:
@@ -128,20 +150,21 @@ class SuricataValidator:
 
         try:
             with tempfile.TemporaryDirectory() as log_dir:
+                cmd = [
+                    self.suricata_path,
+                    "-r",
+                    pcap_path,
+                    "-S",
+                    rule_file,
+                    "-c",
+                    self.suricata_config,
+                    "-l",
+                    log_dir,
+                    "--runmode",
+                    "single",
+                ]
                 proc = subprocess.run(
-                    [
-                        self.suricata_path,
-                        "-r",
-                        pcap_path,
-                        "-S",
-                        rule_file,
-                        "-c",
-                        self.suricata_config,
-                        "-l",
-                        log_dir,
-                        "--runmode",
-                        "single",
-                    ],
+                    cmd,
                     check=False,
                     capture_output=True,
                     text=True,
@@ -165,6 +188,17 @@ class SuricataValidator:
 
                 triggered = len(alerts) > 0
                 msg = (proc.stderr or proc.stdout or "").strip()
+                self._emit_tool_call(
+                    "suricata_replay",
+                    input_payload={"command": cmd, "pcap_path": pcap_path, "rule_count": len(clean_rules)},
+                    output_payload={
+                        "returncode": proc.returncode,
+                        "stdout": proc.stdout,
+                        "stderr": proc.stderr,
+                        "alert_count": len(alerts),
+                        "alerts": alerts,
+                    },
+                )
                 return ValidationResult(
                     is_valid=triggered,
                     format_check_passed=True,
@@ -174,6 +208,11 @@ class SuricataValidator:
                 )
         except FileNotFoundError:
             # Suricata missing: cannot replay, treat as format-only result.
+            self._emit_tool_call(
+                "suricata_replay",
+                input_payload={"pcap_path": pcap_path, "rule_count": len(clean_rules)},
+                output_payload={"status": "suricata_missing"},
+            )
             return ValidationResult(
                 is_valid=True,
                 format_check_passed=True,
@@ -181,6 +220,11 @@ class SuricataValidator:
                 error_message="Suricata binary not found, skipped replay",
             )
         except subprocess.TimeoutExpired:
+            self._emit_tool_call(
+                "suricata_replay",
+                input_payload={"pcap_path": pcap_path, "rule_count": len(clean_rules)},
+                error="Suricata replay timeout",
+            )
             return ValidationResult(
                 is_valid=False,
                 format_check_passed=True,
@@ -192,6 +236,26 @@ class SuricataValidator:
                 os.unlink(rule_file)
             except OSError:
                 pass
+
+    def _emit_tool_call(
+        self,
+        action: str,
+        *,
+        input_payload: dict,
+        output_payload: Optional[dict] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if self.tool_callback is None:
+            return
+        self.tool_callback(
+            {
+                "tool": "suricata",
+                "action": action,
+                "input": input_payload,
+                "output": output_payload,
+                "error": error,
+            }
+        )
 
 
 class SandboxEvaluator:

@@ -55,8 +55,14 @@ DEFAULT_MAX_WORKERS = 4
 
 
 class ReferenceResolver:
-    def __init__(self, llm_client: BaseLLMClient, cache_dir: Optional[str] = None):
+    def __init__(
+        self,
+        llm_client: BaseLLMClient,
+        cache_dir: Optional[str] = None,
+        tool_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ):
         self.llm = llm_client
+        self.tool_callback = tool_callback
         self.cache_dir = Path(
             cache_dir
             or (os.getenv("MA_MEMIDS_REFERENCE_CACHE_DIR") or "").strip()
@@ -114,6 +120,7 @@ class ReferenceResolver:
         reference_batches: Iterable[Iterable[Dict[str, object]]],
         *,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        batch_result_callback: Optional[Callable[[int, Dict[str, object]], None]] = None,
     ) -> List[Dict[str, object]]:
         prepared_batches = [
             [dict(item) for item in batch if isinstance(item, dict)]
@@ -125,6 +132,8 @@ class ReferenceResolver:
         results: List[List[Optional[Dict[str, object]]]] = [
             [None] * len(batch) for batch in prepared_batches
         ]
+        pending_per_batch = [len(batch) for batch in prepared_batches]
+        emitted_batches = [False] * len(prepared_batches)
         task_specs: List[Tuple[int, int, Dict[str, object]]] = []
         for batch_idx, batch in enumerate(prepared_batches):
             for ref_idx, reference in enumerate(batch):
@@ -132,7 +141,11 @@ class ReferenceResolver:
 
         total_tasks = len(task_specs)
         if total_tasks == 0:
-            return [self._aggregate_resolved_references([]) for _ in prepared_batches]
+            aggregated_empty = [self._aggregate_resolved_references([]) for _ in prepared_batches]
+            if batch_result_callback is not None:
+                for batch_idx, payload in enumerate(aggregated_empty):
+                    batch_result_callback(batch_idx, dict(payload))
+            return aggregated_empty
 
         worker_count = min(self.max_workers, total_tasks)
         if progress_callback is not None:
@@ -150,6 +163,14 @@ class ReferenceResolver:
             for batch_idx, ref_idx, reference in task_specs:
                 results[batch_idx][ref_idx] = self._resolve_reference(reference)
                 completed += 1
+                pending_per_batch[batch_idx] = max(0, pending_per_batch[batch_idx] - 1)
+                if pending_per_batch[batch_idx] == 0 and not emitted_batches[batch_idx]:
+                    aggregated = self._aggregate_resolved_references(
+                        [item for item in results[batch_idx] if isinstance(item, dict)]
+                    )
+                    emitted_batches[batch_idx] = True
+                    if batch_result_callback is not None:
+                        batch_result_callback(batch_idx, dict(aggregated))
                 if progress_callback is not None:
                     progress_callback(
                         {
@@ -176,6 +197,14 @@ class ReferenceResolver:
                     for batch_idx, ref_idx in future_map[future]:
                         results[batch_idx][ref_idx] = dict(resolved)
                         completed += 1
+                        pending_per_batch[batch_idx] = max(0, pending_per_batch[batch_idx] - 1)
+                        if pending_per_batch[batch_idx] == 0 and not emitted_batches[batch_idx]:
+                            aggregated = self._aggregate_resolved_references(
+                                [item for item in results[batch_idx] if isinstance(item, dict)]
+                            )
+                            emitted_batches[batch_idx] = True
+                            if batch_result_callback is not None:
+                                batch_result_callback(batch_idx, dict(aggregated))
                     if progress_callback is not None:
                         progress_callback(
                             {
@@ -279,6 +308,33 @@ class ReferenceResolver:
         url_hints = self._extract_url_hints(normalized_url or raw_url)
         cache_key = self._cache_key(raw_url or normalized_url)
         cached = self._read_cache(cache_key)
+        self._emit_tool_call(
+            "reference_cache_lookup",
+            input_payload={"url": raw_url, "cache_key": cache_key},
+            output_payload={
+                "hit": cached is not None,
+                "cached_status": (cached.get("status") if isinstance(cached, dict) else None),
+                "source_url": (cached.get("source_url") if isinstance(cached, dict) else None),
+            },
+        )
+        if cached is not None:
+            cached_result = dict(cached)
+            cached_result["status"] = str(cached_result.get("status") or "resolved")
+            cached_result["resolved_via"] = "cache"
+            cached_result.setdefault("source_url", normalized_url or raw_url)
+            cached_result.setdefault("normalized_url", normalized_url or raw_url)
+            cached_result["cve_ids"] = dedupe_keep_order(
+                seeded_cve_ids + url_hints["cve_ids"] + [str(item).upper().strip() for item in cached_result.get("cve_ids", []) if str(item).strip()]
+            )[:12]
+            cached_result["tech_ids"] = dedupe_keep_order(
+                seeded_tech_ids + url_hints["tech_ids"] + [str(item).upper().strip() for item in cached_result.get("tech_ids", []) if str(item).strip()]
+            )[:12]
+            cached_result["trusted_terms"] = dedupe_keep_order(
+                url_hints["trusted_terms"] + [str(item).strip() for item in cached_result.get("trusted_terms", []) if str(item).strip()]
+            )[:16]
+            cached_result["reference_summary"] = str(cached_result.get("reference_summary") or "").strip()
+            cached_result["error"] = ""
+            return cached_result
 
         last_exc: Optional[Exception] = None
         for candidate_url in candidate_urls or [raw_url]:
@@ -346,38 +402,60 @@ class ReferenceResolver:
         }
 
     def _fetch_url(self, url: str) -> Dict[str, object]:
-        response = self._http.get(url)
-        response.raise_for_status()
+        t0 = time.time()
+        try:
+            response = self._http.get(url)
+            response.raise_for_status()
 
-        content_length = int(response.headers.get("content-length") or 0)
-        if content_length > self.max_download_bytes:
-            raise ValueError(f"content_too_large:{content_length}")
-        raw_bytes = response.content
-        if len(raw_bytes) > self.max_download_bytes:
-            raise ValueError(f"content_too_large:{len(raw_bytes)}")
+            content_length = int(response.headers.get("content-length") or 0)
+            if content_length > self.max_download_bytes:
+                raise ValueError(f"content_too_large:{content_length}")
+            raw_bytes = response.content
+            if len(raw_bytes) > self.max_download_bytes:
+                raise ValueError(f"content_too_large:{len(raw_bytes)}")
 
-        content_type = str(response.headers.get("content-type") or "").lower()
-        if "html" in content_type:
-            text = response.text
-            title = self._extract_html_title(text)
-            clean_text = self._clean_html(text)
-        elif any(token in content_type for token in ("json", "text/plain", "text/markdown", "xml")):
-            text = response.text
-            title = ""
-            clean_text = self._clean_text(text)
-        else:
-            raise ValueError(f"unsupported_content_type:{content_type or 'unknown'}")
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "html" in content_type:
+                text = response.text
+                title = self._extract_html_title(text)
+                clean_text = self._clean_html(text)
+            elif any(token in content_type for token in ("json", "text/plain", "text/markdown", "xml")):
+                text = response.text
+                title = ""
+                clean_text = self._clean_text(text)
+            else:
+                raise ValueError(f"unsupported_content_type:{content_type or 'unknown'}")
 
-        if not clean_text:
-            raise ValueError("empty_content")
+            if not clean_text:
+                raise ValueError("empty_content")
 
-        return {
-            "http_status": response.status_code,
-            "content_type": content_type,
-            "final_url": str(response.url),
-            "title": title,
-            "clean_text": clean_text[: self.max_text_chars],
-        }
+            fetched = {
+                "http_status": response.status_code,
+                "content_type": content_type,
+                "final_url": str(response.url),
+                "title": title,
+                "clean_text": clean_text[: self.max_text_chars],
+            }
+            self._emit_tool_call(
+                "reference_http_fetch",
+                input_payload={"method": "GET", "url": url, "timeout_s": self.timeout_seconds},
+                output_payload={
+                    "http_status": fetched["http_status"],
+                    "content_type": fetched["content_type"],
+                    "final_url": fetched["final_url"],
+                    "title": fetched["title"],
+                    "clean_text": fetched["clean_text"],
+                    "latency_s": round(time.time() - t0, 3),
+                },
+            )
+            return fetched
+        except Exception as exc:
+            self._emit_tool_call(
+                "reference_http_fetch",
+                input_payload={"method": "GET", "url": url, "timeout_s": self.timeout_seconds},
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
     def _parse_reference_page(self, url: str, fetched: Dict[str, object]) -> Dict[str, object]:
         clean_text = str(fetched.get("clean_text") or "").strip()
@@ -439,8 +517,18 @@ class ReferenceResolver:
                         ),
                     },
                 ]
+                t0 = time.time()
                 response = self.llm.chat(messages, temperature=0.1)
                 parsed = self._try_parse_json(response)
+                self._emit_tool_call(
+                    "reference_llm_parse",
+                    input_payload={"url": url, "title": title, "messages": messages},
+                    output_payload={
+                        "response": response,
+                        "parsed": parsed,
+                        "latency_s": round(time.time() - t0, 3),
+                    },
+                )
                 if parsed is None:
                     continue
                 summaries.append(str(parsed.get("reference_summary") or "").strip())
@@ -448,6 +536,11 @@ class ReferenceResolver:
                 tech_ids.extend(m.group(0).upper() for m in TECH_RE.finditer(" ".join(str(item) for item in self._listify(parsed.get("tech_ids")))))
                 trusted_terms.extend(str(item).strip() for item in self._listify(parsed.get("trusted_terms")) if str(item).strip())
             except Exception as exc:
+                self._emit_tool_call(
+                    "reference_llm_parse",
+                    input_payload={"url": url, "title": title},
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 LOGGER.warning("Reference LLM parse failed for %s: %s", url, exc)
 
         if not summaries and not cve_ids and not tech_ids and not trusted_terms:
@@ -738,3 +831,23 @@ class ReferenceResolver:
             return json.dumps(reference, ensure_ascii=False, sort_keys=True, default=str)
         except TypeError:
             return repr(sorted((str(key), str(value)) for key, value in reference.items()))
+
+    def _emit_tool_call(
+        self,
+        action: str,
+        *,
+        input_payload: Dict[str, object],
+        output_payload: Optional[Dict[str, object]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if self.tool_callback is None:
+            return
+        self.tool_callback(
+            {
+                "tool": "reference_resolver",
+                "action": action,
+                "input": input_payload,
+                "output": output_payload,
+                "error": error,
+            }
+        )

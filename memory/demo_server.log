@@ -204,3 +204,31 @@ SystemExit: 1
 2026-04-13 22:16:41,817 | INFO | ma_memids.demo_server | demo_server process exiting
 2026-04-13 22:16:49,721 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
 2026-04-13 22:16:49,725 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-13 22:21:29,755 | INFO | ma_memids.demo_server | demo state snapshot invalidated: graph_clear
+2026-04-13 22:21:29,755 | INFO | ma_memids.demo_server | shared demo pipeline invalidated: graph_clear
+2026-04-13 22:24:32,830 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-04-13 22:24:32,831 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-04-13 22:24:41,398 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-13 22:24:41,401 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-13 22:26:27,335 | INFO | ma_memids.demo_server | demo pipeline using knowledge registry from /storage/zyj_data/MA-MemIDS/memory/knowledge_cache: cve=/storage/zyj_data/MA-MemIDS/knowledge/cves attack=/storage/zyj_data/MA-MemIDS/knowledge/cti-ATT-CK-v18.1 cti=-
+2026-04-14 13:02:05,611 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-14 13:02:05,621 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-14 13:09:32,187 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-14 13:09:32,190 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-14 13:13:14,359 | INFO | ma_memids.demo_server | demo state snapshot invalidated: graph_clear
+2026-04-14 13:13:14,359 | INFO | ma_memids.demo_server | shared demo pipeline invalidated: graph_clear
+2026-04-14 13:13:37,995 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-14 13:13:37,998 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-14 13:13:58,457 | INFO | ma_memids.demo_server | demo pipeline using knowledge registry from /storage/zyj_data/MA-MemIDS/memory/knowledge_cache: cve=/storage/zyj_data/MA-MemIDS/knowledge/cves attack=/storage/zyj_data/MA-MemIDS/knowledge/cti-ATT-CK-v18.1 cti=-
+2026-04-14 13:30:51,458 | INFO | ma_memids.demo_server | demo state snapshot invalidated: init_complete
+2026-04-14 13:30:51,458 | INFO | ma_memids.demo_server | shared demo pipeline invalidated: init_complete
+2026-04-14 13:36:26,468 | INFO | ma_memids.demo_server | demo state snapshot invalidated: graph_clear
+2026-04-14 13:36:26,468 | INFO | ma_memids.demo_server | shared demo pipeline invalidated: graph_clear
+2026-04-14 13:37:17,941 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-04-14 13:37:17,948 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-04-14 13:38:49,926 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-14 13:38:49,930 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090
+2026-04-14 13:39:00,138 | WARNING | ma_memids.demo_server | flask app.run returned unexpectedly
+2026-04-14 13:39:00,139 | INFO | ma_memids.demo_server | demo_server process exiting
+2026-04-14 17:54:09,630 | INFO | ma_memids.demo_server | demo_server bootstrap: cwd=/storage/zyj_data/MA-MemIDS python=/storage/zyj_data/miniconda3/envs/thinkleap/bin/python argv=['demo_server.py'] dotenv_loaded=True log_path=/storage/zyj_data/MA-MemIDS/memory/demo_server.log
+2026-04-14 17:54:09,644 | INFO | ma_memids.demo_server | starting flask dev server host=127.0.0.1 port=8090

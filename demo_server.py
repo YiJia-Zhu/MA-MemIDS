@@ -5,11 +5,13 @@ import atexit
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,7 @@ from ma_memids.graph import NoteGraph
 from ma_memids.llm_client import BaseLLMClient, create_llm_client
 from ma_memids.knowledge import load_knowledge_source_registry
 from ma_memids.pipeline import MAMemIDSPipeline
+from ma_memids.run_trace import RunArtifacts, TracingLLMClient
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +41,7 @@ DEFAULT_SANDBOX_ROOT = ROOT / "sandbox_samples"
 DEFAULT_ATTACK_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "attack"
 DEFAULT_BENIGN_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "benign"
 DEFAULT_KNOWLEDGE_CACHE_DIR = ROOT / "memory" / "knowledge_cache"
+JOB_LOG_ROOT = ROOT / "memory" / "job_logs"
 
 MAX_JOB_EVENTS = 1200
 MAX_JOBS = 120
@@ -80,6 +84,9 @@ def _configure_logging() -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     logger.propagate = False
     return logger
 
@@ -111,31 +118,6 @@ def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
 
 atexit.register(_log_process_exit)
 sys.excepthook = _log_uncaught_exception
-
-
-class TracingLLMClient(BaseLLMClient):
-    def __init__(self, inner: BaseLLMClient, sink: List[Dict[str, Any]]):
-        self.inner = inner
-        self.sink = sink
-
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
-        t0 = time.time()
-        response = self.inner.chat(messages, temperature=temperature)
-        dt = time.time() - t0
-        self.sink.append(
-            {
-                "model": self.inner.model_name(),
-                "temperature": temperature,
-                "latency_s": round(dt, 3),
-                "messages": messages,
-                "response": response,
-            }
-        )
-        return response
-
-    def model_name(self) -> str:
-        return self.inner.model_name()
-
 
 def _resolve_pipeline_setup() -> Dict[str, Any]:
     knowledge_cache_dir = _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
@@ -178,6 +160,8 @@ def _build_pipeline(
     llm_client: Optional[BaseLLMClient] = None,
     llm_model: Optional[str] = None,
     context: str,
+    knowledge_progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    tool_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> MAMemIDSPipeline:
     setup = _resolve_pipeline_setup()
     _log_pipeline_setup(setup, context=context)
@@ -190,13 +174,27 @@ def _build_pipeline(
         cti_knowledge_path=setup["cti_kb"] or None,
         knowledge_cache_dir=str(setup["knowledge_cache_dir"]),
         knowledge_build_if_missing=setup["knowledge_build_if_missing"],
+        knowledge_progress_callback=knowledge_progress_callback,
+        tool_callback=tool_callback,
     )
 
 
-def create_pipeline_with_trace(llm_calls: List[Dict[str, Any]], llm_model: Optional[str] = None) -> MAMemIDSPipeline:
+def create_pipeline_with_trace(
+    artifacts: RunArtifacts,
+    llm_calls: List[Dict[str, Any]],
+    *,
+    llm_model: Optional[str] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    tool_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> MAMemIDSPipeline:
     base_client = create_llm_client(model=llm_model)
-    tracing_client = TracingLLMClient(base_client, llm_calls)
-    return _build_pipeline(llm_client=tracing_client, context="demo pipeline")
+    tracing_client = TracingLLMClient(base_client, artifacts, llm_calls)
+    return _build_pipeline(
+        llm_client=tracing_client,
+        context="demo pipeline",
+        knowledge_progress_callback=progress_callback,
+        tool_callback=tool_callback,
+    )
 
 
 def _shared_pipeline_cache_key() -> tuple[str, str, str, str]:
@@ -252,6 +250,8 @@ def _state_stats_payload(graph: NoteGraph, raw: Dict[str, Any]) -> Dict[str, Any
     rule_notes = [n for n in notes if n.note_type == "rule"]
     baseline = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
     embedding = raw.get("embedding") if isinstance(raw, dict) else {}
+    knowledge_cache_dir = _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
+    knowledge_sources = load_knowledge_source_registry(knowledge_cache_dir)
     return {
         "total_notes": len(notes),
         "rule_notes": len(rule_notes),
@@ -259,15 +259,42 @@ def _state_stats_payload(graph: NoteGraph, raw: Dict[str, Any]) -> Dict[str, Any
         "llm_model": (os.getenv("LLM_MODEL") or "gpt-4.1").strip() or "gpt-4.1",
         "embedding": embedding if isinstance(embedding, dict) else {},
         "knowledge": {
-            "cache_dir": str(_resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))),
-            "sources": load_knowledge_source_registry(
-                _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
-            ),
+            "cache_dir": str(knowledge_cache_dir),
+            "sources": _knowledge_source_status(knowledge_cache_dir, knowledge_sources),
         },
         "thresholds": graph.thresholds.__dict__,
         "graph_index": graph.index_stats(),
         "sandbox_baseline": baseline if isinstance(baseline, dict) else {},
     }
+
+
+def _knowledge_source_status(cache_root: Path, sources: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    status: Dict[str, Dict[str, Any]] = {}
+    for source_name in ("cve", "attack", "cti"):
+        input_path = str(sources.get(source_name) or "").strip()
+        record: Dict[str, Any] = {
+            "path": input_path,
+            "configured": bool(input_path),
+            "cache_ready": False,
+            "doc_count": 0,
+            "manifest_path": None,
+        }
+        if input_path:
+            manifest_glob = cache_root / source_name
+            if manifest_glob.exists():
+                for manifest_path in sorted(manifest_glob.glob("*/manifest.json")):
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if str(manifest.get("input_path") or "").strip() != input_path:
+                        continue
+                    record["cache_ready"] = True
+                    record["doc_count"] = int(manifest.get("doc_count") or 0)
+                    record["manifest_path"] = str(manifest_path)
+                    break
+        status[source_name] = record
+    return status
 
 
 def _invalidate_shared_pipeline(reason: str) -> None:
@@ -349,6 +376,172 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in sorted(value, key=lambda x: str(x))]
+    return str(value)
+
+
+def _job_log_dir(job_id: str) -> Path:
+    if job_id.startswith("web-"):
+        _, kind, stamp, short_id = job_id.split("-", 3)
+        return JOB_LOG_ROOT / f"{stamp}_{kind}_{short_id}"
+    return JOB_LOG_ROOT / job_id
+
+
+def _job_log_path(job_id: str, name: str) -> Path:
+    return _job_log_dir(job_id) / name
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _append_jsonl_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(payload), ensure_ascii=False))
+        f.write("\n")
+
+
+def _sanitize_job_request(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = dict(payload or {})
+    cleanup_paths = data.get("cleanup_paths")
+    if isinstance(cleanup_paths, list):
+        data["cleanup_paths"] = [str(Path(p).name) for p in cleanup_paths]
+    return _json_safe(data)
+
+
+def _make_demo_tool_callback(artifacts: RunArtifacts, sink: List[Dict[str, Any]]) -> Callable[[Dict[str, Any]], None]:
+    def _callback(payload: Dict[str, Any]) -> None:
+        record = artifacts.record_tool_call(
+            tool=str(payload.get("tool") or "tool"),
+            action=str(payload.get("action") or "call"),
+            input_payload=dict(payload.get("input") or {}),
+            output_payload=(dict(payload.get("output") or {}) if isinstance(payload.get("output"), dict) else None),
+            error=(str(payload.get("error")) if payload.get("error") else None),
+        )
+        sink.append(record)
+
+    return _callback
+
+
+def _make_demo_progress_callback(
+    job_id: str,
+    artifacts: RunArtifacts,
+) -> Callable[[Dict[str, Any]], None]:
+    def _callback(payload: Dict[str, Any]) -> None:
+        normalized = artifacts.record_progress(payload)
+        _append_job_event(
+            job_id,
+            "progress",
+            str(normalized.get("label") or normalized.get("stage") or payload.get("event") or "progress"),
+            {"raw": _json_safe(payload), "normalized": normalized},
+        )
+
+    return _callback
+
+
+def _quote_command(parts: List[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts if str(part) != "")
+
+
+def _request_to_terminal_command(kind: str, request_payload: Optional[Dict[str, Any]]) -> str:
+    payload = dict(request_payload or {})
+    parts = ["python", "main.py"]
+    if kind == "init":
+        parts.append("init")
+        if payload.get("llm_model"):
+            parts.extend(["--model", str(payload["llm_model"])])
+        max_rules = payload.get("max_rules")
+        if max_rules is not None:
+            parts.extend(["--max-rules", str(max_rules)])
+        if payload.get("source") == "upload":
+            rules_arg = f"<upload:{payload.get('source_label') or 'rules.rules'}>"
+        else:
+            rules_arg = str(payload.get("rules_path") or payload.get("source_label") or "rules")
+        parts.extend(["--rules", rules_arg])
+        return _quote_command(parts)
+
+    if kind == "process":
+        parts.append("process")
+        if payload.get("llm_model"):
+            parts.extend(["--model", str(payload["llm_model"])])
+        if payload.get("pcap_path"):
+            pcap_label = str(payload.get("pcap_label") or "").strip()
+            parts.extend(["--pcap", pcap_label or "<upload:pcap_file>"])
+        if payload.get("traffic_text"):
+            parts.extend(["--traffic-text", str(payload["traffic_text"])])
+        attack_pcaps = [str(x) for x in (payload.get("attack_pcaps") or []) if str(x).strip()]
+        if attack_pcaps:
+            attack_labels = [str(x) for x in (payload.get("attack_labels") or []) if str(x).strip()]
+            parts.extend(["--attack-pcaps", ",".join(attack_labels or attack_pcaps)])
+        benign_pcaps = [str(x) for x in (payload.get("benign_pcaps") or []) if str(x).strip()]
+        if benign_pcaps:
+            benign_labels = [str(x) for x in (payload.get("benign_labels") or []) if str(x).strip()]
+            parts.extend(["--benign-pcaps", ",".join(benign_labels or benign_pcaps)])
+        human_override = payload.get("human_override") or {}
+        if isinstance(human_override, dict):
+            if human_override.get("intent"):
+                parts.extend(["--override-intent", str(human_override["intent"])])
+            tactics = human_override.get("tactics") or []
+            if tactics:
+                parts.extend(["--override-tactics", ",".join(str(x) for x in tactics if str(x).strip())])
+            keywords = human_override.get("keywords") or []
+            if keywords:
+                parts.extend(["--override-keywords", ",".join(str(x) for x in keywords if str(x).strip())])
+        return _quote_command(parts)
+
+    return _quote_command(parts)
+
+
+def _write_latest_job_marker(kind: str, job_id: str, log_dir: Path) -> None:
+    marker = {
+        "job_id": job_id,
+        "kind": kind,
+        "log_dir": str(log_dir),
+        "updated_at": _now_iso(),
+    }
+    _write_json_file(JOB_LOG_ROOT / f"latest_{kind}.json", marker)
+
+
+def _append_job_index(event: str, payload: Dict[str, Any]) -> None:
+    record = {"at": _now_iso(), "event": event, **_json_safe(payload)}
+    _append_jsonl_file(JOB_LOG_ROOT / "index.jsonl", record)
+
+
+def _write_job_snapshot(job_id: str) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        snapshot = {
+            "job_id": job["job_id"],
+            "kind": job["kind"],
+            "source": job.get("source"),
+            "status": job["status"],
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+            "events": list(job.get("events", [])),
+            "result": job.get("result"),
+            "error": job.get("error"),
+            "log_dir": job.get("log_dir"),
+            "request": job.get("request"),
+            "terminal_command": job.get("terminal_command"),
+            "progress": job.get("progress"),
+        }
+    _write_json_file(_job_log_path(job_id, "snapshot.json"), snapshot)
+
+
 def _cleanup_files(paths: List[str]) -> None:
     for path in paths:
         try:
@@ -397,14 +590,21 @@ def _trim_jobs_if_needed() -> None:
         JOBS.pop(jid, None)
 
 
-def _create_job(kind: str) -> str:
+def _create_job(kind: str, request_payload: Optional[Dict[str, Any]] = None) -> str:
     now_epoch = time.time()
     now_iso = _now_iso()
-    job_id = uuid.uuid4().hex[:12]
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_id = uuid.uuid4().hex[:12]
+    job_id = f"web-{kind}-{stamp}-{short_id}"
+    log_dir = _job_log_dir(job_id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    sanitized_request = _sanitize_job_request(request_payload)
+    terminal_command = _request_to_terminal_command(kind, sanitized_request)
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
             "kind": kind,
+            "source": "web",
             "status": "running",
             "created_at": now_iso,
             "updated_at": now_iso,
@@ -413,31 +613,65 @@ def _create_job(kind: str) -> str:
             "events": [],
             "result": None,
             "error": None,
+            "log_dir": str(log_dir),
+            "request": sanitized_request,
+            "terminal_command": terminal_command,
+            "progress": {"stage": "pending", "label": "pending", "percent": 0.0, "at": now_iso},
         }
         _trim_jobs_if_needed()
+    _write_json_file(
+        _job_log_path(job_id, "meta.json"),
+        {
+            "job_id": job_id,
+            "kind": kind,
+            "created_at": now_iso,
+            "log_dir": str(log_dir),
+        },
+    )
+    _write_json_file(_job_log_path(job_id, "request.json"), sanitized_request)
+    _write_json_file(_job_log_path(job_id, "command.json"), {"terminal_command": terminal_command})
+    (_job_log_path(job_id, "command.sh")).write_text(terminal_command + "\n", encoding="utf-8")
+    _append_job_index(
+        "job_created",
+        {
+            "job_id": job_id,
+            "kind": kind,
+            "source": "web",
+            "log_dir": str(log_dir),
+            "request": sanitized_request,
+            "terminal_command": terminal_command,
+        },
+    )
+    _write_latest_job_marker(kind, job_id, log_dir)
+    _write_job_snapshot(job_id)
     return job_id
 
 
 def _append_job_event(job_id: str, event_type: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
     now_epoch = time.time()
     now_iso = _now_iso()
+    event_record = {
+        "at": now_iso,
+        "type": event_type,
+        "message": message,
+        "payload": payload or {},
+    }
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
             return
         events = job.setdefault("events", [])
-        events.append(
-            {
-                "at": now_iso,
-                "type": event_type,
-                "message": message,
-                "payload": payload or {},
-            }
-        )
+        events.append(event_record)
         if len(events) > MAX_JOB_EVENTS:
             del events[: len(events) - MAX_JOB_EVENTS]
         job["updated_at"] = now_iso
         job["updated_at_epoch"] = now_epoch
+        if event_type == "progress":
+            normalized = ((payload or {}).get("normalized") if isinstance(payload, dict) else None)
+            if isinstance(normalized, dict):
+                job["progress"] = normalized
+    _append_jsonl_file(_job_log_path(job_id, "events.jsonl"), event_record)
+    _write_job_snapshot(job_id)
 
 
 def _finish_job_success(job_id: str, result: Dict[str, Any]) -> None:
@@ -452,9 +686,15 @@ def _finish_job_success(job_id: str, result: Dict[str, Any]) -> None:
         job["error"] = None
         job["updated_at"] = now_iso
         job["updated_at_epoch"] = now_epoch
+        job["progress"] = {"stage": "done", "label": "done", "percent": 100.0, "at": now_iso}
+        kind = str(job.get("kind") or "")
+        log_dir = str(job.get("log_dir") or "")
+    _write_json_file(_job_log_path(job_id, "result.json"), result)
+    _append_job_index("job_succeeded", {"job_id": job_id, "kind": kind, "log_dir": log_dir})
+    _write_job_snapshot(job_id)
 
 
-def _finish_job_failed(job_id: str, error: str) -> None:
+def _finish_job_failed(job_id: str, error: str, traceback_text: str = "") -> None:
     now_epoch = time.time()
     now_iso = _now_iso()
     with JOBS_LOCK:
@@ -465,6 +705,24 @@ def _finish_job_failed(job_id: str, error: str) -> None:
         job["error"] = error
         job["updated_at"] = now_iso
         job["updated_at_epoch"] = now_epoch
+        job["progress"] = {
+            "stage": "failed",
+            "label": "failed",
+            "percent": float((job.get("progress") or {}).get("percent") or 0.0),
+            "at": now_iso,
+        }
+        kind = str(job.get("kind") or "")
+        log_dir = str(job.get("log_dir") or "")
+    _write_json_file(
+        _job_log_path(job_id, "error.json"),
+        {
+            "error": error,
+            "traceback": traceback_text,
+            "failed_at": now_iso,
+        },
+    )
+    _append_job_index("job_failed", {"job_id": job_id, "kind": kind, "log_dir": log_dir, "error": error})
+    _write_job_snapshot(job_id)
 
 
 def _get_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
@@ -481,7 +739,41 @@ def _get_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
             "events": list(job.get("events", [])),
             "result": job.get("result"),
             "error": job.get("error"),
+            "log_dir": job.get("log_dir"),
+            "request": job.get("request"),
+            "terminal_command": job.get("terminal_command"),
+            "progress": job.get("progress"),
         }
+
+
+def _load_job_snapshot_from_disk(job_id: str) -> Optional[Dict[str, Any]]:
+    snapshot_path = _job_log_path(job_id, "snapshot.json")
+    if not snapshot_path.exists():
+        return None
+    try:
+        raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _recent_job_snapshots(limit: int = 20) -> List[Dict[str, Any]]:
+    snapshots: List[Dict[str, Any]] = []
+    if not JOB_LOG_ROOT.exists():
+        return snapshots
+    for snapshot_path in JOB_LOG_ROOT.glob("*/snapshot.json"):
+        try:
+            raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        raw.setdefault("log_dir", str(snapshot_path.parent))
+        snapshots.append(raw)
+    snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return snapshots[:limit]
 
 
 def _parse_max_rules(value: str) -> Optional[int]:
@@ -534,6 +826,7 @@ def _resolve_init_request() -> Dict[str, Any]:
         "source": source,
         "source_label": source_label,
         "max_rules": max_rules,
+        "resume": True,
         "llm_model": llm_model,
         "cleanup_paths": tmp_paths,
     }
@@ -584,6 +877,9 @@ def _resolve_process_request() -> Dict[str, Any]:
     pcap_path = _save_upload(pcap_file)
     attack_paths = _save_upload_many(attack_files)
     benign_paths = _save_upload_many(benign_files)
+    pcap_label = (pcap_file.filename if pcap_file is not None and pcap_file.filename else "")
+    attack_labels = [f.filename for f in attack_files if f.filename]
+    benign_labels = [f.filename for f in benign_files if f.filename]
 
     if not pcap_path and not traffic_text:
         _cleanup_files(upload_paths)
@@ -617,8 +913,11 @@ def _resolve_process_request() -> Dict[str, Any]:
         "llm_model": llm_model,
         "traffic_text": traffic_text,
         "pcap_path": pcap_path,
+        "pcap_label": pcap_label,
         "attack_pcaps": attack_pcaps,
+        "attack_labels": attack_labels,
         "benign_pcaps": benign_pcaps,
+        "benign_labels": benign_labels,
         "sandbox_config": {
             "attack_source": attack_source,
             "attack_count": len(attack_pcaps),
@@ -634,14 +933,26 @@ def _resolve_process_request() -> Dict[str, Any]:
 
 def _run_init_payload(
     init_args: Dict[str, Any],
+    artifacts: RunArtifacts,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    tool_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls, llm_model=init_args["llm_model"])
+    tool_calls: List[Dict[str, Any]] = []
+    pipeline = create_pipeline_with_trace(
+        artifacts,
+        llm_calls,
+        llm_model=init_args["llm_model"],
+        progress_callback=progress_callback,
+        tool_callback=(tool_callback or _make_demo_tool_callback(artifacts, tool_calls)),
+    )
+    if progress_callback is not None:
+        progress_callback({"event": "pipeline_build_ready"})
     count = pipeline.initialize_from_rules_file(
         init_args["rules_path"],
         max_rules=init_args["max_rules"],
         progress_callback=progress_callback,
+        resume=bool(init_args.get("resume", True)),
     )
     _invalidate_shared_pipeline("init_complete")
     return {
@@ -650,17 +961,30 @@ def _run_init_payload(
         "init_source": init_args["source"],
         "init_source_label": init_args["source_label"],
         "max_rules": init_args["max_rules"],
+        "resume": bool(init_args.get("resume", True)),
         "stats": pipeline.stats(),
         "llm_calls": llm_calls,
+        "tool_calls": tool_calls,
     }
 
 
 def _run_process_payload(
     process_args: Dict[str, Any],
+    artifacts: RunArtifacts,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    tool_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     llm_calls: List[Dict[str, Any]] = []
-    pipeline = create_pipeline_with_trace(llm_calls, llm_model=process_args["llm_model"])
+    tool_calls: List[Dict[str, Any]] = []
+    pipeline = create_pipeline_with_trace(
+        artifacts,
+        llm_calls,
+        llm_model=process_args["llm_model"],
+        progress_callback=progress_callback,
+        tool_callback=(tool_callback or _make_demo_tool_callback(artifacts, tool_calls)),
+    )
+    if progress_callback is not None:
+        progress_callback({"event": "pipeline_build_ready"})
     outcome = pipeline.process_unmatched_traffic_with_trace(
         pcap_path=process_args["pcap_path"],
         traffic_text=process_args["traffic_text"],
@@ -677,6 +1001,7 @@ def _run_process_payload(
         "ok": True,
         "outcome": outcome,
         "llm_calls": llm_calls,
+        "tool_calls": tool_calls,
         "stats": pipeline.stats(),
         "sandbox_config": {
             "input": process_args.get("sandbox_config", {}),
@@ -814,7 +1139,7 @@ def api_status() -> Any:
 
 @app.get("/api/graph/summary")
 def api_graph_summary() -> Any:
-    graph, _ = _get_state_snapshot()
+    graph, raw = _get_state_snapshot()
     notes = graph.all_notes()
     rule_notes = [n for n in notes if n.note_type == "rule"]
     total_links = sum(len(n.links) for n in notes)
@@ -828,6 +1153,7 @@ def api_graph_summary() -> Any:
                 "traffic_notes": 0,
                 "total_links": total_links,
                 "state_path": str(STATE_PATH),
+                "knowledge": _state_stats_payload(graph, raw).get("knowledge"),
             },
             "latest_notes": [_note_preview(n) for n in latest_notes],
         }
@@ -1070,9 +1396,17 @@ def api_init() -> Any:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     try:
-        payload = _run_init_payload(init_args)
+        log_dir = JOB_LOG_ROOT / f"adhoc_init_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        artifacts = RunArtifacts(log_dir, kind="init", source="web")
+        progress_callback = lambda event: artifacts.record_progress(event)
+        payload = _run_init_payload(init_args, artifacts, progress_callback=progress_callback)
+        artifacts.finalize(status="succeeded", result=payload)
         return jsonify(payload)
     except Exception as exc:
+        try:
+            artifacts.finalize(status="failed", error=f"{type(exc).__name__}: {exc}")  # type: ignore[name-defined]
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": f"init failed: {type(exc).__name__}: {exc}"}), 500
     finally:
         _cleanup_files(init_args["cleanup_paths"])
@@ -1086,9 +1420,17 @@ def api_process() -> Any:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     try:
-        payload = _run_process_payload(process_args)
+        log_dir = JOB_LOG_ROOT / f"adhoc_process_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        artifacts = RunArtifacts(log_dir, kind="process", source="web")
+        progress_callback = lambda event: artifacts.record_progress(event)
+        payload = _run_process_payload(process_args, artifacts, progress_callback=progress_callback)
+        artifacts.finalize(status="succeeded", result=payload)
         return jsonify(payload)
     except Exception as exc:
+        try:
+            artifacts.finalize(status="failed", error=f"{type(exc).__name__}: {exc}")  # type: ignore[name-defined]
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": f"process failed: {type(exc).__name__}: {exc}"}), 500
     finally:
         _cleanup_files(process_args["cleanup_paths"])
@@ -1101,7 +1443,8 @@ def api_init_async() -> Any:
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
-    job_id = _create_job("init")
+    job_id = _create_job("init", request_payload=init_args)
+    log_dir = str(_job_log_dir(job_id))
     _append_job_event(
         job_id,
         "status",
@@ -1110,31 +1453,36 @@ def api_init_async() -> Any:
             "source": init_args["source"],
             "source_label": init_args["source_label"],
             "max_rules": init_args["max_rules"],
+            "job_log_dir": log_dir,
         },
     )
 
     def _worker() -> None:
+        artifacts = RunArtifacts(log_dir, kind="init", source="web", job_id=job_id)
+        progress_callback = _make_demo_progress_callback(job_id, artifacts)
         try:
+            progress_callback({"event": "pipeline_build_start"})
             payload = _run_init_payload(
                 init_args,
-                progress_callback=lambda event: _append_job_event(
-                    job_id,
-                    "progress",
-                    str(event.get("event") or "progress"),
-                    event,
-                ),
+                artifacts,
+                progress_callback=progress_callback,
             )
+            progress_callback({"event": "job_done"})
             _append_job_event(job_id, "status", "init_task_done", {"initialized_rules": payload["initialized_rules"]})
+            artifacts.finalize(status="succeeded", result=payload)
             _finish_job_success(job_id, payload)
         except Exception as exc:
             message = f"init failed: {type(exc).__name__}: {exc}"
-            _append_job_event(job_id, "error", "init_task_failed", {"error": message})
-            _finish_job_failed(job_id, message)
+            traceback_text = traceback.format_exc()
+            progress_callback({"event": "job_failed"})
+            artifacts.finalize(status="failed", error=message)
+            _append_job_event(job_id, "error", "init_task_failed", {"error": message, "traceback": traceback_text})
+            _finish_job_failed(job_id, message, traceback_text=traceback_text)
         finally:
             _cleanup_files(init_args["cleanup_paths"])
 
-    threading.Thread(target=_worker, daemon=True).start()
-    return jsonify({"ok": True, "job_id": job_id})
+    threading.Thread(target=_worker, daemon=True, name=f"demo-init-{job_id}").start()
+    return jsonify({"ok": True, "job_id": job_id, "job_log_dir": log_dir})
 
 
 @app.post("/api/process_async")
@@ -1144,7 +1492,8 @@ def api_process_async() -> Any:
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
-    job_id = _create_job("process")
+    job_id = _create_job("process", request_payload=process_args)
+    log_dir = str(_job_log_dir(job_id))
     _append_job_event(
         job_id,
         "status",
@@ -1155,20 +1504,21 @@ def api_process_async() -> Any:
             "sandbox_config": process_args.get("sandbox_config", {}),
             "attack_preview": process_args["attack_pcaps"][:3],
             "benign_preview": process_args["benign_pcaps"][:3],
+            "job_log_dir": log_dir,
         },
     )
 
     def _worker() -> None:
+        artifacts = RunArtifacts(log_dir, kind="process", source="web", job_id=job_id)
+        progress_callback = _make_demo_progress_callback(job_id, artifacts)
         try:
+            progress_callback({"event": "pipeline_build_start"})
             payload = _run_process_payload(
                 process_args,
-                progress_callback=lambda event: _append_job_event(
-                    job_id,
-                    "progress",
-                    str(event.get("event") or "progress"),
-                    event,
-                ),
+                artifacts,
+                progress_callback=progress_callback,
             )
+            progress_callback({"event": "job_done"})
             _append_job_event(
                 job_id,
                 "status",
@@ -1178,24 +1528,59 @@ def api_process_async() -> Any:
                     "mode": payload["outcome"]["result"]["mode"],
                 },
             )
+            artifacts.finalize(status="succeeded", result=payload)
             _finish_job_success(job_id, payload)
         except Exception as exc:
             message = f"process failed: {type(exc).__name__}: {exc}"
-            _append_job_event(job_id, "error", "process_task_failed", {"error": message})
-            _finish_job_failed(job_id, message)
+            traceback_text = traceback.format_exc()
+            progress_callback({"event": "job_failed"})
+            artifacts.finalize(status="failed", error=message)
+            _append_job_event(job_id, "error", "process_task_failed", {"error": message, "traceback": traceback_text})
+            _finish_job_failed(job_id, message, traceback_text=traceback_text)
         finally:
             _cleanup_files(process_args["cleanup_paths"])
 
-    threading.Thread(target=_worker, daemon=True).start()
-    return jsonify({"ok": True, "job_id": job_id})
+    threading.Thread(target=_worker, daemon=True, name=f"demo-process-{job_id}").start()
+    return jsonify({"ok": True, "job_id": job_id, "job_log_dir": log_dir})
 
 
 @app.get("/api/job/<job_id>")
 def api_job(job_id: str) -> Any:
     snapshot = _get_job_snapshot(job_id)
     if snapshot is None:
+        snapshot = _load_job_snapshot_from_disk(job_id)
+    if snapshot is None:
         return jsonify({"ok": False, "error": f"job not found: {job_id}"}), 404
     return jsonify({"ok": True, "job": snapshot})
+
+
+@app.get("/api/jobs/recent")
+def api_jobs_recent() -> Any:
+    try:
+        limit = _parse_int(request.args.get("limit"), default=20, min_value=1, max_value=100)
+    except ValueError:
+        return jsonify({"ok": False, "error": "limit must be integer"}), 400
+
+    jobs = []
+    for item in _recent_job_snapshots(limit):
+        preview = {
+            "job_id": item.get("job_id"),
+            "kind": item.get("kind"),
+            "source": item.get("source") or "unknown",
+            "status": item.get("status"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+            "log_dir": item.get("log_dir"),
+            "terminal_command": item.get("terminal_command"),
+            "error": item.get("error"),
+            "request": item.get("request"),
+            "result": item.get("result"),
+            "progress": item.get("progress"),
+            "event_count": len(item.get("events") or []),
+            "events_tail": (item.get("events") or [])[-10:],
+        }
+        jobs.append(preview)
+    return jsonify({"ok": True, "jobs": jobs})
 
 
 if __name__ == "__main__":

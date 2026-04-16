@@ -30,6 +30,17 @@ function pretty(x) {
   }
 }
 
+function shellQuote(value) {
+  const text = String(value ?? '');
+  if (!text) {
+    return "''";
+  }
+  if (/^[A-Za-z0-9_./:@=-]+$/.test(text)) {
+    return text;
+  }
+  return `'${text.replace(/'/g, "'\"'\"'")}'`;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -81,10 +92,115 @@ function nodeFillColor(node, isSelected) {
   return GRAPH_NODE_COLORS[node.note_type] || GRAPH_NODE_COLORS.default;
 }
 
+function fileLabel(inputEl, fallback) {
+  if (!inputEl || !inputEl.files || !inputEl.files.length) {
+    return fallback;
+  }
+  const names = Array.from(inputEl.files).map((file) => `<upload:${file.name}>`);
+  return names.join(',');
+}
+
+function buildInitCommandFromForm(formEl) {
+  const formData = new FormData(formEl);
+  const parts = ['python', 'main.py', 'init'];
+  const model = String(formData.get('model') || '').trim();
+  const maxRules = String(formData.get('max_rules') || '').trim();
+  const rulesInput = formEl.querySelector('input[name="rules_file"]');
+  const defaultRulesPath = String(formData.get('default_rules_path') || 'rules').trim() || 'rules';
+  const rulesArg = fileLabel(rulesInput, defaultRulesPath);
+  if (model) {
+    parts.push('--model', model);
+  }
+  if (maxRules && maxRules !== '0') {
+    parts.push('--max-rules', maxRules);
+  }
+  parts.push('--rules', rulesArg);
+  return parts.map(shellQuote).join(' ');
+}
+
+function buildProcessCommandFromForm(formEl) {
+  const formData = new FormData(formEl);
+  const parts = ['python', 'main.py', 'process'];
+  const model = String(formData.get('model') || '').trim();
+  const pcapInput = formEl.querySelector('input[name="pcap_file"]');
+  const attackInput = formEl.querySelector('input[name="attack_pcap"]');
+  const benignInput = formEl.querySelector('input[name="benign_pcap"]');
+  const trafficText = String(formData.get('traffic_text') || '').trim();
+  const overrideIntent = String(formData.get('override_intent') || '').trim();
+  const overrideTactics = String(formData.get('override_tactics') || '').trim();
+  const overrideKeywords = String(formData.get('override_keywords') || '').trim();
+
+  if (model) {
+    parts.push('--model', model);
+  }
+
+  const pcapArg = fileLabel(pcapInput, '');
+  if (pcapArg) {
+    parts.push('--pcap', pcapArg);
+  }
+  if (trafficText) {
+    parts.push('--traffic-text', trafficText);
+  }
+
+  const attackArg = fileLabel(attackInput, '');
+  if (attackArg) {
+    parts.push('--attack-pcaps', attackArg);
+  }
+
+  const benignArg = fileLabel(benignInput, '');
+  if (benignArg) {
+    parts.push('--benign-pcaps', benignArg);
+  }
+
+  if (overrideIntent) {
+    parts.push('--override-intent', overrideIntent);
+  }
+  if (overrideTactics) {
+    parts.push('--override-tactics', overrideTactics);
+  }
+  if (overrideKeywords) {
+    parts.push('--override-keywords', overrideKeywords);
+  }
+  return parts.map(shellQuote).join(' ');
+}
+
 function clearEvents(containerId) {
   const root = document.getElementById(containerId);
   root.innerHTML = '';
   root.dataset.renderedCount = '0';
+}
+
+function clearOutputBox(id) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.textContent = 'CLEAR';
+  }
+}
+
+function clearAllOutputs() {
+  [
+    'status-json',
+    'graph-summary',
+    'graph-list',
+    'graph-note-detail',
+    'graph-clear-result',
+    'init-command',
+    'init-output',
+    'init-llm-calls',
+    'init-tool-calls',
+    'process-command',
+    'process-result',
+    'process-trace',
+    'llm-calls',
+    'tool-calls',
+    'recent-jobs',
+  ].forEach(clearOutputBox);
+  clearEvents('init-live');
+  clearEvents('process-live');
+  document.getElementById('init-live-status').textContent = 'CLEAR';
+  document.getElementById('process-live-status').textContent = 'CLEAR';
+  setProgress('init', { percent: 0, label: 'CLEAR' });
+  setProgress('process', { percent: 0, label: 'CLEAR' });
 }
 
 function appendEvents(containerId, events) {
@@ -120,6 +236,19 @@ function setAllFoldBlocks(expand) {
   blocks.forEach((el) => {
     el.open = expand;
   });
+}
+
+function setProgress(prefix, progress) {
+  const bar = document.getElementById(`${prefix}-progress-bar`);
+  const text = document.getElementById(`${prefix}-progress-text`);
+  const percent = Math.max(0, Math.min(100, Number(progress && progress.percent) || 0));
+  const label = String((progress && (progress.label || progress.stage)) || '');
+  if (bar) {
+    bar.value = percent;
+  }
+  if (text) {
+    text.textContent = `${percent.toFixed(1)}%${label ? ` · ${label}` : ''}`;
+  }
 }
 
 function setGraphCanvasMessage(message) {
@@ -235,6 +364,18 @@ async function fetchGraphSummary() {
     out.textContent = pretty(data);
   } catch (err) {
     out.textContent = `Load summary failed: ${err}`;
+  }
+}
+
+async function fetchRecentJobs() {
+  const out = document.getElementById('recent-jobs');
+  out.textContent = 'Loading...';
+  try {
+    const resp = await fetch('/api/jobs/recent?limit=20');
+    const data = await resp.json();
+    out.textContent = pretty(data);
+  } catch (err) {
+    out.textContent = `Load recent jobs failed: ${err}`;
   }
 }
 
@@ -617,10 +758,12 @@ async function runAsyncJob({
   clearEvents(liveContainerId);
   submitBtn.disabled = true;
   liveStatus.textContent = 'Submitting...';
+  setProgress(liveContainerId.startsWith('init') ? 'init' : 'process', { percent: 0, label: 'submitting' });
 
   const formData = new FormData(formEl);
   const startedAt = Date.now();
   let jobId = '';
+  let jobLogDir = '';
 
   try {
     const resp = await fetch(startUrl, {
@@ -632,6 +775,10 @@ async function runAsyncJob({
       throw new Error(data.error || 'Failed to create async job');
     }
     jobId = data.job_id;
+    jobLogDir = data.job_log_dir || '';
+    if (jobLogDir) {
+      liveStatus.textContent = `Job ${jobId} created · logs=${jobLogDir}`;
+    }
   } catch (err) {
     liveStatus.textContent = `Start failed: ${err}`;
     submitBtn.disabled = false;
@@ -655,11 +802,14 @@ async function runAsyncJob({
     const job = jobData.job;
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
     appendEvents(liveContainerId, job.events || []);
-    liveStatus.textContent = `Job ${job.job_id} · ${job.status} · ${elapsed}s · events=${(job.events || []).length}`;
+    const jobProgress = job.progress || { percent: 0, label: 'running' };
+    setProgress(liveContainerId.startsWith('init') ? 'init' : 'process', jobProgress);
+    const logLabel = job.log_dir || jobLogDir;
+    liveStatus.textContent = `Job ${job.job_id} · ${job.status} · ${Number(jobProgress.percent || 0).toFixed(1)}% · ${elapsed}s · events=${(job.events || []).length}${logLabel ? ` · logs=${logLabel}` : ''}`;
 
     if (job.status === 'succeeded') {
       submitBtn.disabled = false;
-      return job.result;
+      return { jobId: job.job_id, jobLogDir: logLabel, result: job.result };
     }
     if (job.status === 'failed') {
       submitBtn.disabled = false;
@@ -672,8 +822,39 @@ async function runAsyncJob({
 
 document.getElementById('btn-refresh').addEventListener('click', fetchStatus);
 document.getElementById('btn-graph-summary').addEventListener('click', fetchGraphSummary);
+document.getElementById('btn-recent-jobs').addEventListener('click', fetchRecentJobs);
+document.getElementById('btn-clear-outputs').addEventListener('click', clearAllOutputs);
 document.getElementById('btn-expand-all').addEventListener('click', () => setAllFoldBlocks(true));
 document.getElementById('btn-collapse-all').addEventListener('click', () => setAllFoldBlocks(false));
+
+document.getElementById('init-show-command').addEventListener('click', () => {
+  document.getElementById('init-command').textContent = buildInitCommandFromForm(document.getElementById('init-form'));
+});
+
+document.getElementById('process-show-command').addEventListener('click', () => {
+  document.getElementById('process-command').textContent = buildProcessCommandFromForm(document.getElementById('process-form'));
+});
+
+document.getElementById('init-clear').addEventListener('click', () => {
+  clearEvents('init-live');
+  document.getElementById('init-live-status').textContent = 'CLEAR';
+  clearOutputBox('init-command');
+  clearOutputBox('init-output');
+  clearOutputBox('init-llm-calls');
+  clearOutputBox('init-tool-calls');
+  setProgress('init', { percent: 0, label: 'CLEAR' });
+});
+
+document.getElementById('process-clear').addEventListener('click', () => {
+  clearEvents('process-live');
+  document.getElementById('process-live-status').textContent = 'CLEAR';
+  clearOutputBox('process-command');
+  clearOutputBox('process-result');
+  clearOutputBox('process-trace');
+  clearOutputBox('llm-calls');
+  clearOutputBox('tool-calls');
+  setProgress('process', { percent: 0, label: 'CLEAR' });
+});
 
 document.getElementById('graph-viz-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -704,21 +885,34 @@ document.getElementById('graph-clear-form').addEventListener('submit', async (e)
 document.getElementById('init-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const output = document.getElementById('init-output');
+  const llmBox = document.getElementById('init-llm-calls');
+  const toolBox = document.getElementById('init-tool-calls');
   output.textContent = 'Running...';
+  llmBox.textContent = 'Running...';
+  toolBox.textContent = 'Running...';
   try {
-    const data = await runAsyncJob({
+    const completed = await runAsyncJob({
       startUrl: '/api/init_async',
       formEl: e.currentTarget,
       submitBtnId: 'init-submit',
       liveContainerId: 'init-live',
       liveStatusId: 'init-live-status',
     });
-    output.textContent = pretty(data);
+    output.textContent = pretty({
+      job_id: completed.jobId,
+      job_log_dir: completed.jobLogDir,
+      result: completed.result,
+    });
+    llmBox.textContent = pretty((completed.result && completed.result.llm_calls) || []);
+    toolBox.textContent = pretty((completed.result && completed.result.tool_calls) || []);
     await fetchStatus();
     await fetchGraphSummary();
     await fetchGraphView(document.getElementById('graph-viz-form'));
+    await fetchRecentJobs();
   } catch (err) {
     output.textContent = `Init failed: ${err}`;
+    llmBox.textContent = 'No llm calls';
+    toolBox.textContent = 'No tool calls';
   }
 });
 
@@ -727,40 +921,53 @@ document.getElementById('process-form').addEventListener('submit', async (e) => 
   const resultBox = document.getElementById('process-result');
   const traceBox = document.getElementById('process-trace');
   const llmBox = document.getElementById('llm-calls');
+  const toolBox = document.getElementById('tool-calls');
 
   resultBox.textContent = 'Running...';
   traceBox.textContent = 'Running...';
   llmBox.textContent = 'Running...';
+  toolBox.textContent = 'Running...';
 
   try {
-    const data = await runAsyncJob({
+    const completed = await runAsyncJob({
       startUrl: '/api/process_async',
       formEl: e.currentTarget,
       submitBtnId: 'process-submit',
       liveContainerId: 'process-live',
       liveStatusId: 'process-live-status',
     });
+    const data = completed.result;
 
     if (!data.ok) {
-      resultBox.textContent = pretty(data);
+      resultBox.textContent = pretty({
+        job_id: completed.jobId,
+        job_log_dir: completed.jobLogDir,
+        result: data,
+      });
       traceBox.textContent = 'No trace';
       llmBox.textContent = pretty(data.llm_calls || []);
+      toolBox.textContent = pretty(data.tool_calls || []);
       return;
     }
 
     resultBox.textContent = pretty({
+      job_id: completed.jobId,
+      job_log_dir: completed.jobLogDir,
       result: data.outcome.result,
       sandbox_config: data.sandbox_config || {},
     });
     traceBox.textContent = pretty(data.outcome.trace);
     llmBox.textContent = pretty(data.llm_calls || []);
+    toolBox.textContent = pretty(data.tool_calls || []);
     await fetchStatus();
     await fetchGraphSummary();
     await fetchGraphView(document.getElementById('graph-viz-form'));
+    await fetchRecentJobs();
   } catch (err) {
     resultBox.textContent = `Process failed: ${err}`;
     traceBox.textContent = 'No trace';
     llmBox.textContent = 'No llm calls';
+    toolBox.textContent = 'No tool calls';
   }
 });
 
@@ -778,6 +985,7 @@ async function bootstrapPage() {
   await fetchStatus();
   await fetchGraphSummary();
   await fetchGraphView(document.getElementById('graph-viz-form'));
+  await fetchRecentJobs();
 }
 
 bootstrapPage();

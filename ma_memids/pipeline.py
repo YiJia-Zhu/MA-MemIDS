@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -11,7 +12,7 @@ from .embedding import SentenceTransformerEmbedder
 from .graph import NoteGraph
 from .knowledge import DualPathRetriever
 from .llm_client import BaseLLMClient, create_llm_client
-from .models import Link, Note, ProcessResult
+from .models import Link, Note, ProcessResult, RuleProposal
 from .note_builder import NoteBuilder
 from .pcap_parser import PCAPParser
 from .prompts import TRAFFIC_CLASSIFICATION_SYSTEM, TRAFFIC_CLASSIFICATION_USER
@@ -35,6 +36,8 @@ class MAMemIDSPipeline:
         suricata_config: str = "/etc/suricata/suricata.yaml",
         validation_mode: str = "strict",
         knowledge_build_if_missing: bool = True,
+        knowledge_progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        tool_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,16 +53,18 @@ class MAMemIDSPipeline:
             attack_path=attack_knowledge_path,
             cti_path=cti_knowledge_path,
             build_if_missing=knowledge_build_if_missing,
+            progress_callback=knowledge_progress_callback,
         )
 
         self.llm = llm_client or create_llm_client(model=llm_model)
-        self.note_builder = NoteBuilder(self.retriever, self.embedder, self.llm)
+        self.note_builder = NoteBuilder(self.retriever, self.embedder, self.llm, tool_callback=tool_callback)
         self.graph = NoteGraph(weights=self.weights, thresholds=self.thresholds)
 
         self.validator = SuricataValidator(
             suricata_path=suricata_path,
             suricata_config=suricata_config,
             validation_mode=validation_mode,
+            tool_callback=tool_callback,
         )
         self.sandbox = SandboxEvaluator(self.validator, thresholds=self.thresholds)
         self.rule_engine = RuleGenerationEngine(self.llm, thresholds=self.thresholds, runtime=self.runtime)
@@ -74,6 +79,7 @@ class MAMemIDSPipeline:
         rules_file: str,
         max_rules: Optional[int] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        resume: bool = True,
     ) -> int:
         path = Path(rules_file)
         if not path.exists():
@@ -88,6 +94,13 @@ class MAMemIDSPipeline:
                 break
 
         total_rules = len(rules)
+        checkpoint_paths = self._init_checkpoint_paths(path=path, rules=rules, max_rules=max_rules)
+        completed_count = 0
+        if resume:
+            completed_count = self._load_init_checkpoint_completed_count(checkpoint_paths)
+            if completed_count > total_rules:
+                completed_count = 0
+                self._cleanup_init_checkpoint(checkpoint_paths)
         if progress_callback:
             progress_callback(
                 {
@@ -95,8 +108,21 @@ class MAMemIDSPipeline:
                     "count": total_rules,
                     "source_path": str(path),
                     "max_rules": max_rules,
+                    "completed_count": completed_count,
+                    "resume_enabled": resume,
                 }
             )
+            if resume and completed_count > 0:
+                progress_callback(
+                    {
+                        "event": "init_resume",
+                        "count": completed_count,
+                        "total_rules": total_rules,
+                        "source_path": str(path),
+                        "max_rules": max_rules,
+                        "checkpoint_dir": str(checkpoint_paths["dir"]),
+                    }
+                )
 
         parsed_rules = [parse_rule_fields(rule) for rule in rules]
 
@@ -108,23 +134,112 @@ class MAMemIDSPipeline:
             payload.setdefault("max_rules", max_rules)
             progress_callback(payload)
 
-        prefetched_reference_evidence = self.note_builder.resolve_rule_reference_evidence_batch(
-            parsed_rules,
-            progress_callback=_emit_reference_progress,
-        )
+        remaining_indices = list(range(completed_count, total_rules))
+        prefetched_reference_map: Dict[int, Dict[str, object]] = {}
+        if resume:
+            prefetched_reference_map.update(self._load_init_checkpoint_reference_map(checkpoint_paths, total_rules=total_rules))
 
-        count = 0
-        new_notes: List[Note] = []
-        for idx, rule in enumerate(rules):
+        missing_reference_indices: List[int] = []
+        parsed_rules_for_resolution: List[Dict[str, object]] = []
+        for idx in remaining_indices:
+            if idx in prefetched_reference_map:
+                continue
             fields = parsed_rules[idx]
-            reference_evidence = prefetched_reference_evidence[idx] if idx < len(prefetched_reference_evidence) else {}
+            references = fields.get("references", [])
+            if not isinstance(references, list) or not references:
+                empty_reference = self._empty_reference_evidence()
+                prefetched_reference_map[idx] = empty_reference
+                if resume:
+                    self._append_init_checkpoint_reference(
+                        checkpoint_paths,
+                        rule_index=idx,
+                        rule_text=rules[idx],
+                        fields=fields,
+                        reference_evidence=empty_reference,
+                    )
+                continue
+            missing_reference_indices.append(idx)
+            parsed_rules_for_resolution.append(fields)
+
+        if parsed_rules_for_resolution:
+            def _store_reference_result(batch_idx: int, reference_evidence: Dict[str, object]) -> None:
+                rule_index = missing_reference_indices[batch_idx]
+                normalized = dict(reference_evidence or {})
+                prefetched_reference_map[rule_index] = normalized
+                if resume:
+                    self._append_init_checkpoint_reference(
+                        checkpoint_paths,
+                        rule_index=rule_index,
+                        rule_text=rules[rule_index],
+                        fields=parsed_rules[rule_index],
+                        reference_evidence=normalized,
+                    )
+
+            resolved_reference_evidence = self.note_builder.resolve_rule_reference_evidence_batch(
+                parsed_rules_for_resolution,
+                progress_callback=_emit_reference_progress,
+                batch_result_callback=_store_reference_result,
+            )
+            for batch_idx, reference_evidence in enumerate(resolved_reference_evidence):
+                rule_index = missing_reference_indices[batch_idx]
+                if rule_index in prefetched_reference_map:
+                    continue
+                normalized = dict(reference_evidence or {})
+                prefetched_reference_map[rule_index] = normalized
+                if resume:
+                    self._append_init_checkpoint_reference(
+                        checkpoint_paths,
+                        rule_index=rule_index,
+                        rule_text=rules[rule_index],
+                        fields=parsed_rules[rule_index],
+                        reference_evidence=normalized,
+                    )
+
+        prefetched_reference_evidence = [
+            dict(prefetched_reference_map.get(idx) or self._empty_reference_evidence())
+            for idx in remaining_indices
+        ]
+
+        if resume:
+            self._write_init_checkpoint_meta(
+                checkpoint_paths,
+                {
+                    "source_path": str(path.resolve(strict=False)),
+                    "max_rules": max_rules,
+                    "total_rules": total_rules,
+                    "completed_count": completed_count,
+                    "reference_completed_count": len(prefetched_reference_map),
+                    "updated_at": now_iso(),
+                },
+            )
+
+        count = completed_count
+        in_memory_notes: List[Note] = []
+        for offset, idx in enumerate(range(completed_count, total_rules)):
+            rule = rules[idx]
+            fields = parsed_rules[idx]
+            reference_evidence = prefetched_reference_evidence[offset] if offset < len(prefetched_reference_evidence) else {}
             note = self.note_builder.build_rule_note(
                 rule,
                 parsed_fields=fields,
                 reference_evidence=reference_evidence,
             )
-            new_notes.append(note)
+            if resume:
+                self._append_init_checkpoint_note(checkpoint_paths, note)
+            else:
+                in_memory_notes.append(note)
             count += 1
+            if resume:
+                self._write_init_checkpoint_meta(
+                    checkpoint_paths,
+                    {
+                        "source_path": str(path.resolve(strict=False)),
+                        "max_rules": max_rules,
+                        "total_rules": total_rules,
+                        "completed_count": count,
+                        "updated_at": now_iso(),
+                    },
+                )
             if progress_callback and (count == 1 or count % 25 == 0 or count == total_rules):
                 progress_callback(
                     {
@@ -136,6 +251,10 @@ class MAMemIDSPipeline:
                     }
                 )
 
+        if resume:
+            new_notes = self._load_init_checkpoint_notes(checkpoint_paths)
+        else:
+            new_notes = in_memory_notes
         self.graph.add_or_update_many(new_notes)
         self.save_state()
         if progress_callback:
@@ -148,6 +267,148 @@ class MAMemIDSPipeline:
                 }
             )
         return count
+
+    def _init_checkpoint_paths(
+        self,
+        *,
+        path: Path,
+        rules: List[str],
+        max_rules: Optional[int],
+    ) -> Dict[str, Path]:
+        blob = json.dumps(
+            {
+                "source_path": str(path.resolve(strict=False)),
+                "max_rules": max_rules,
+                "rules_sha256": hashlib.sha256("\n".join(rules).encode("utf-8", errors="ignore")).hexdigest(),
+                "total_rules": len(rules),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        key = hashlib.sha256(blob).hexdigest()[:16]
+        checkpoint_dir = self.state_path.parent / "checkpoints" / f"init_{key}"
+        return {
+            "dir": checkpoint_dir,
+            "meta": checkpoint_dir / "meta.json",
+            "notes": checkpoint_dir / "notes.jsonl",
+            "references": checkpoint_dir / "references.jsonl",
+        }
+
+    def _load_init_checkpoint_completed_count(self, paths: Dict[str, Path]) -> int:
+        notes_path = paths["notes"]
+        if not notes_path.exists():
+            return 0
+        count = 0
+        with notes_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    count += 1
+        return count
+
+    def _append_init_checkpoint_note(self, paths: Dict[str, Path], note: Note) -> None:
+        notes_path = paths["notes"]
+        notes_path.parent.mkdir(parents=True, exist_ok=True)
+        with notes_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(note.to_dict(), ensure_ascii=False))
+            f.write("\n")
+
+    def _load_init_checkpoint_reference_map(self, paths: Dict[str, Path], *, total_rules: int) -> Dict[int, Dict[str, object]]:
+        references_path = paths["references"]
+        out: Dict[int, Dict[str, object]] = {}
+        if not references_path.exists():
+            return out
+        with references_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                try:
+                    rule_index = int(parsed.get("rule_index"))
+                except (TypeError, ValueError):
+                    continue
+                if rule_index < 0 or rule_index >= total_rules:
+                    continue
+                reference_evidence = parsed.get("reference_evidence")
+                if isinstance(reference_evidence, dict):
+                    out[rule_index] = dict(reference_evidence)
+        return out
+
+    def _append_init_checkpoint_reference(
+        self,
+        paths: Dict[str, Path],
+        *,
+        rule_index: int,
+        rule_text: str,
+        fields: Dict[str, object],
+        reference_evidence: Dict[str, object],
+    ) -> None:
+        references_path = paths["references"]
+        references_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "record_type": "rule_reference_evidence",
+            "rule_index": rule_index,
+            "sid": extract_sid(rule_text),
+            "protocol": fields.get("protocol"),
+            "msg": fields.get("msg"),
+            "references": list(fields.get("references", [])) if isinstance(fields.get("references"), list) else [],
+            "reference_evidence": dict(reference_evidence or {}),
+            "rule_preview": rule_text[:240],
+            "updated_at": now_iso(),
+        }
+        with references_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.write("\n")
+
+    def _empty_reference_evidence(self) -> Dict[str, object]:
+        return {
+            "trusted_cve_ids": [],
+            "trusted_tech_ids": [],
+            "trusted_terms": [],
+            "reference_summary": "",
+            "source_urls": [],
+            "resolved_references": [],
+        }
+
+    def _load_init_checkpoint_notes(self, paths: Dict[str, Path]) -> List[Note]:
+        notes_path = paths["notes"]
+        out: List[Note] = []
+        if not notes_path.exists():
+            return out
+        with notes_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    out.append(Note.from_dict(parsed))
+        return out
+
+    def _write_init_checkpoint_meta(self, paths: Dict[str, Path], payload: Dict[str, Any]) -> None:
+        meta_path = paths["meta"]
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _cleanup_init_checkpoint(self, paths: Dict[str, Path]) -> None:
+        checkpoint_dir = paths["dir"]
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     def process_unmatched_traffic(
         self,
@@ -193,6 +454,55 @@ class MAMemIDSPipeline:
             "trace": trace,
         }
 
+    def analyze_unmatched_traffic_draft(
+        self,
+        *,
+        pcap_path: Optional[str] = None,
+        traffic_text: Optional[str] = None,
+        attack_pcaps: Optional[List[str]] = None,
+        benign_pcaps: Optional[List[str]] = None,
+        human_override: Optional[Dict[str, object]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, object]:
+        outcome = self._analyze_unmatched_traffic_core(
+            pcap_path=pcap_path,
+            traffic_text=traffic_text,
+            attack_pcaps=attack_pcaps,
+            benign_pcaps=benign_pcaps,
+            human_override=human_override,
+            with_trace=True,
+            progress_callback=progress_callback,
+        )
+        if outcome["kind"] == "result":
+            return {
+                "kind": "result",
+                "result": outcome["result"].__dict__,
+                "trace": outcome["trace"],
+            }
+        return {
+            "kind": "draft",
+            "draft": outcome["draft"],
+            "trace": outcome["trace"],
+        }
+
+    def execute_unmatched_traffic_draft_with_trace(
+        self,
+        *,
+        draft: Dict[str, object],
+        trace: Optional[Dict[str, object]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, object]:
+        result, final_trace = self._execute_unmatched_traffic_draft_core(
+            draft=draft,
+            with_trace=True,
+            progress_callback=progress_callback,
+            trace=trace,
+        )
+        return {
+            "result": result.__dict__,
+            "trace": final_trace,
+        }
+
     def _process_unmatched_traffic_core(
         self,
         *,
@@ -204,17 +514,48 @@ class MAMemIDSPipeline:
         with_trace: bool,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]],
     ) -> tuple[ProcessResult, Dict[str, object]]:
-        trace: Dict[str, object] = {
-            "inputs": {
-                "pcap_path": pcap_path,
-                "has_traffic_text": bool(traffic_text),
-                "attack_pcaps": attack_pcaps or [],
-                "benign_pcaps": benign_pcaps or [],
-                "human_override": human_override or {},
-            },
-            "steps": [],
-        }
-        steps: List[Dict[str, object]] = trace["steps"]  # type: ignore[assignment]
+        analysis = self._analyze_unmatched_traffic_core(
+            pcap_path=pcap_path,
+            traffic_text=traffic_text,
+            attack_pcaps=attack_pcaps,
+            benign_pcaps=benign_pcaps,
+            human_override=human_override,
+            with_trace=with_trace,
+            progress_callback=progress_callback,
+        )
+        if analysis["kind"] == "result":
+            return analysis["result"], analysis["trace"]
+        return self._execute_unmatched_traffic_draft_core(
+            draft=analysis["draft"],
+            with_trace=with_trace,
+            progress_callback=progress_callback,
+            trace=analysis["trace"],
+        )
+
+    def _make_trace_runtime(
+        self,
+        *,
+        pcap_path: Optional[str],
+        traffic_text: Optional[str],
+        attack_pcaps: Optional[List[str]],
+        benign_pcaps: Optional[List[str]],
+        human_override: Optional[Dict[str, object]],
+        with_trace: bool,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        trace: Optional[Dict[str, object]] = None,
+    ) -> tuple[Dict[str, object], Callable[[Dict[str, Any]], None], Callable[[str, Dict[str, Any] | List[Dict[str, Any]]], None]]:
+        if trace is None:
+            trace = {
+                "inputs": {
+                    "pcap_path": pcap_path,
+                    "has_traffic_text": bool(traffic_text),
+                    "attack_pcaps": attack_pcaps or [],
+                    "benign_pcaps": benign_pcaps or [],
+                    "human_override": human_override or {},
+                },
+                "steps": [],
+            }
+        steps: List[Dict[str, object]] = trace.setdefault("steps", [])  # type: ignore[assignment]
 
         def _emit_progress(payload: Dict[str, Any]) -> None:
             if progress_callback is not None:
@@ -224,6 +565,157 @@ class MAMemIDSPipeline:
             if with_trace:
                 steps.append({"name": name, "output": output})
             _emit_progress({"event": "step", "name": name, "output": output})
+
+        return trace, _emit_progress, _record_step
+
+    def _build_candidate_with_dual_retrieval(
+        self,
+        *,
+        base_traffic_text: str,
+        protocol: Optional[str],
+        traffic_metadata: Dict[str, Any],
+        human_override: Optional[Dict[str, object]],
+        feedback_blocks: List[str],
+        retry_index: int,
+        record_step: Callable[[str, Dict[str, Any] | List[Dict[str, Any]]], None],
+    ) -> tuple[Note, List[object], RuleProposal]:
+        text_for_note = base_traffic_text
+        if feedback_blocks:
+            feedback_blob = "\n".join(feedback_blocks)
+            text_for_note = f"{base_traffic_text}\n\n[FAILURE_FEEDBACK]\n{feedback_blob}"
+
+        traffic_note_local = self.note_builder.build_traffic_note(
+            traffic_text=text_for_note,
+            protocol=protocol,
+            metadata=traffic_metadata,
+        )
+
+        suffix = "" if retry_index == 0 else f"_retry{retry_index}"
+        record_step(
+            f"dual_retrieval{suffix}",
+            {
+                "retrieval_plan": (
+                    traffic_note_local.external_knowledge.debug.get("plan", {})
+                    if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                    else {}
+                ),
+                "feature_inventory": (
+                    traffic_note_local.external_knowledge.debug.get("feature_inventory", {})
+                    if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                    else {}
+                ),
+                "sparse_query": (
+                    traffic_note_local.external_knowledge.debug.get("sparse_query", "")
+                    if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                    else ""
+                ),
+                "dense_query": (
+                    traffic_note_local.external_knowledge.debug.get("dense_query", "")
+                    if isinstance(traffic_note_local.external_knowledge.debug, dict)
+                    else ""
+                ),
+                "cve_ids": traffic_note_local.external_knowledge.cve_ids[:10],
+                "tech_ids": traffic_note_local.external_knowledge.tech_ids[:10],
+                "feedback_blocks": feedback_blocks[-3:],
+            },
+        )
+        record_step(
+            f"traffic_note{suffix}",
+            {
+                "note_id": traffic_note_local.note_id,
+                "intent": traffic_note_local.intent,
+                "keywords": traffic_note_local.keywords[:20],
+                "tactics": traffic_note_local.tactics[:10],
+                "cve_ids": traffic_note_local.external_knowledge.cve_ids[:10],
+                "tech_ids": traffic_note_local.external_knowledge.tech_ids[:10],
+                "network_context": (
+                    traffic_note_local.metadata.get("network_context", {})
+                    if isinstance(traffic_note_local.metadata, dict)
+                    else {}
+                ),
+            },
+        )
+
+        if human_override:
+            self._apply_human_override(traffic_note_local, human_override)
+            record_step(
+                f"human_override{suffix}",
+                {
+                    "intent": traffic_note_local.intent,
+                    "keywords": traffic_note_local.keywords[:20],
+                    "tactics": traffic_note_local.tactics[:10],
+                },
+            )
+
+        ranked_local = self.graph.search_top_k(traffic_note_local)
+        candidate_notes_local = [
+            self.graph.get(item.note_id)
+            for item in ranked_local
+            if self.graph.get(item.note_id) is not None
+        ]
+        candidate_notes_local = [n for n in candidate_notes_local if n is not None]
+        record_step(
+            f"topk_search{suffix}",
+            [
+                {"note_id": item.note_id, "score": item.score}
+                for item in ranked_local
+            ],
+        )
+
+        proposal_local = self.rule_engine.propose_rule(
+            traffic_note=traffic_note_local,
+            candidate_notes=candidate_notes_local,
+            candidate_scores=ranked_local,
+            all_rule_notes=self._rule_notes(),
+        )
+        record_step(
+            f"rule_proposal{suffix}",
+            {
+                "mode": proposal_local.mode,
+                "base_note_id": proposal_local.base_note_id,
+                "max_similarity": proposal_local.max_similarity,
+                "rule_text": proposal_local.rule_text,
+            },
+        )
+
+        return traffic_note_local, ranked_local, proposal_local
+
+    def _serialize_rule_proposal(self, proposal: RuleProposal) -> Dict[str, object]:
+        return {
+            "rule_text": proposal.rule_text,
+            "mode": proposal.mode,
+            "base_note_id": proposal.base_note_id,
+            "max_similarity": proposal.max_similarity,
+        }
+
+    def _deserialize_rule_proposal(self, payload: Dict[str, object]) -> RuleProposal:
+        return RuleProposal(
+            rule_text=str(payload.get("rule_text") or ""),
+            mode=str(payload.get("mode") or ""),
+            base_note_id=(str(payload.get("base_note_id")) if payload.get("base_note_id") else None),
+            max_similarity=float(payload.get("max_similarity") or 0.0),
+        )
+
+    def _analyze_unmatched_traffic_core(
+        self,
+        *,
+        pcap_path: Optional[str],
+        traffic_text: Optional[str],
+        attack_pcaps: Optional[List[str]],
+        benign_pcaps: Optional[List[str]],
+        human_override: Optional[Dict[str, object]],
+        with_trace: bool,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Dict[str, object]:
+        trace, _emit_progress, _record_step = self._make_trace_runtime(
+            pcap_path=pcap_path,
+            traffic_text=traffic_text,
+            attack_pcaps=attack_pcaps,
+            benign_pcaps=benign_pcaps,
+            human_override=human_override,
+            with_trace=with_trace,
+            progress_callback=progress_callback,
+        )
 
         _emit_progress(
             {
@@ -237,7 +729,7 @@ class MAMemIDSPipeline:
             raise ValueError("Either pcap_path or traffic_text must be provided")
 
         if pcap_path:
-            summary = PCAPParser.parse(pcap_path)
+            summary = PCAPParser.parse(pcap_path, tool_callback=self.note_builder.tool_callback)
             traffic_text = summary.to_text()
             protocol = summary.protocol
             traffic_metadata = {
@@ -294,112 +786,18 @@ class MAMemIDSPipeline:
                     merge_candidates=[],
                     linked_notes=matched_note_ids if isinstance(matched_note_ids, list) else [],
                 )
-                return result, trace
-
-        def _build_candidate_with_dual_retrieval(feedback_blocks: List[str], retry_index: int) -> tuple[Note, List[object], object]:
-            text_for_note = base_traffic_text
-            if feedback_blocks:
-                feedback_blob = "\n".join(feedback_blocks)
-                text_for_note = f"{base_traffic_text}\n\n[FAILURE_FEEDBACK]\n{feedback_blob}"
-
-            traffic_note_local = self.note_builder.build_traffic_note(
-                traffic_text=text_for_note,
-                protocol=protocol,
-                metadata=traffic_metadata,
-            )
-
-            suffix = "" if retry_index == 0 else f"_retry{retry_index}"
-            _record_step(
-                f"dual_retrieval{suffix}",
-                {
-                    "retrieval_plan": (
-                        traffic_note_local.external_knowledge.debug.get("plan", {})
-                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
-                        else {}
-                    ),
-                    "feature_inventory": (
-                        traffic_note_local.external_knowledge.debug.get("feature_inventory", {})
-                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
-                        else {}
-                    ),
-                    "sparse_query": (
-                        traffic_note_local.external_knowledge.debug.get("sparse_query", "")
-                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
-                        else ""
-                    ),
-                    "dense_query": (
-                        traffic_note_local.external_knowledge.debug.get("dense_query", "")
-                        if isinstance(traffic_note_local.external_knowledge.debug, dict)
-                        else ""
-                    ),
-                    "cve_ids": traffic_note_local.external_knowledge.cve_ids[:10],
-                    "tech_ids": traffic_note_local.external_knowledge.tech_ids[:10],
-                    "feedback_blocks": feedback_blocks[-3:],
-                },
-            )
-            _record_step(
-                f"traffic_note{suffix}",
-                {
-                    "note_id": traffic_note_local.note_id,
-                    "intent": traffic_note_local.intent,
-                    "keywords": traffic_note_local.keywords[:20],
-                    "tactics": traffic_note_local.tactics[:10],
-                    "cve_ids": traffic_note_local.external_knowledge.cve_ids[:10],
-                    "tech_ids": traffic_note_local.external_knowledge.tech_ids[:10],
-                    "network_context": (
-                        traffic_note_local.metadata.get("network_context", {})
-                        if isinstance(traffic_note_local.metadata, dict)
-                        else {}
-                    ),
-                },
-            )
-
-            if human_override:
-                self._apply_human_override(traffic_note_local, human_override)
-                _record_step(
-                    f"human_override{suffix}",
-                    {
-                        "intent": traffic_note_local.intent,
-                        "keywords": traffic_note_local.keywords[:20],
-                        "tactics": traffic_note_local.tactics[:10],
-                    },
-                )
-
-            ranked_local = self.graph.search_top_k(traffic_note_local)
-            candidate_notes_local = [
-                self.graph.get(item.note_id)
-                for item in ranked_local
-                if self.graph.get(item.note_id) is not None
-            ]
-            candidate_notes_local = [n for n in candidate_notes_local if n is not None]
-            _record_step(
-                f"topk_search{suffix}",
-                [
-                    {"note_id": item.note_id, "score": item.score}
-                    for item in ranked_local
-                ],
-            )
-
-            proposal_local = self.rule_engine.propose_rule(
-                traffic_note=traffic_note_local,
-                candidate_notes=candidate_notes_local,
-                candidate_scores=ranked_local,
-                all_rule_notes=self._rule_notes(),
-            )
-            _record_step(
-                f"rule_proposal{suffix}",
-                {
-                    "mode": proposal_local.mode,
-                    "base_note_id": proposal_local.base_note_id,
-                    "max_similarity": proposal_local.max_similarity,
-                    "rule_text": proposal_local.rule_text,
-                },
-            )
-
-            return traffic_note_local, ranked_local, proposal_local
+                return {"kind": "result", "result": result, "trace": trace}
 
         feedback_blocks: List[str] = []
-        traffic_note, _, proposal = _build_candidate_with_dual_retrieval(feedback_blocks=feedback_blocks, retry_index=0)
+        traffic_note, _, proposal = self._build_candidate_with_dual_retrieval(
+            base_traffic_text=base_traffic_text,
+            protocol=protocol,
+            traffic_metadata=traffic_metadata,
+            human_override=human_override,
+            feedback_blocks=feedback_blocks,
+            retry_index=0,
+            record_step=_record_step,
+        )
 
         attack_set, benign_set, classify_info = self._resolve_sandbox_sets(
             analyzed_pcap=pcap_path,
@@ -418,6 +816,75 @@ class MAMemIDSPipeline:
                 "benign_pcaps_preview": benign_set[:5],
             },
         )
+
+        return {
+            "kind": "draft",
+            "draft": {
+                "pcap_path": pcap_path,
+                "base_traffic_text": base_traffic_text,
+                "protocol": protocol,
+                "traffic_metadata": traffic_metadata,
+                "human_override": dict(human_override or {}),
+                "traffic_note": traffic_note.to_dict(),
+                "proposal": self._serialize_rule_proposal(proposal),
+                "attack_set": list(attack_set),
+                "benign_set": list(benign_set),
+            },
+            "trace": trace,
+        }
+
+    def _execute_unmatched_traffic_draft_core(
+        self,
+        *,
+        draft: Dict[str, object],
+        with_trace: bool,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        trace: Optional[Dict[str, object]] = None,
+    ) -> tuple[ProcessResult, Dict[str, object]]:
+        trace: Dict[str, object] = {
+            **(trace or {}),
+        }
+        trace, _, _record_step = self._make_trace_runtime(
+            pcap_path=str(draft.get("pcap_path") or "") or None,
+            traffic_text=str(draft.get("base_traffic_text") or ""),
+            attack_pcaps=list(draft.get("attack_set") or []),
+            benign_pcaps=list(draft.get("benign_set") or []),
+            human_override=dict(draft.get("human_override") or {}),
+            with_trace=with_trace,
+            progress_callback=progress_callback,
+            trace=trace,
+        )
+
+        pcap_path = str(draft.get("pcap_path") or "") or None
+        base_traffic_text = str(draft.get("base_traffic_text") or "")
+        protocol = str(draft.get("protocol") or "") or None
+        traffic_metadata = dict(draft.get("traffic_metadata") or {})
+        human_override = dict(draft.get("human_override") or {})
+        traffic_note = Note.from_dict(dict(draft.get("traffic_note") or {}))
+        proposal = self._deserialize_rule_proposal(dict(draft.get("proposal") or {}))
+        attack_set = [str(item) for item in (draft.get("attack_set") or []) if str(item).strip()]
+        benign_set = [str(item) for item in (draft.get("benign_set") or []) if str(item).strip()]
+
+        if pcap_path:
+            recheck = self._precheck_existing_ruleset(pcap_path)
+            _record_step("existing_ruleset_recheck", recheck)
+            if recheck.get("confirmed_hit"):
+                matched_note_ids = recheck.get("matched_note_ids", [])
+                alert_count = int(recheck.get("alert_count") or 0)
+                result = ProcessResult(
+                    success=True,
+                    mode="already_covered",
+                    rule_text=None,
+                    score=None,
+                    reason=(
+                        f"existing ruleset already triggered on analyzed pcap "
+                        f"(alerts={alert_count}, matched_sids={recheck.get('matched_sids', [])})"
+                    ),
+                    retries=0,
+                    merge_candidates=[],
+                    linked_notes=matched_note_ids if isinstance(matched_note_ids, list) else [],
+                )
+                return result, trace
 
         if not attack_set and not benign_set:
             ok, err = self.validator.validate_rule_format(proposal.rule_text)
@@ -613,9 +1080,14 @@ class MAMemIDSPipeline:
                 },
             )
 
-            traffic_note, _, proposal = _build_candidate_with_dual_retrieval(
+            traffic_note, _, proposal = self._build_candidate_with_dual_retrieval(
+                base_traffic_text=base_traffic_text,
+                protocol=protocol,
+                traffic_metadata=traffic_metadata,
+                human_override=human_override or None,
                 feedback_blocks=feedback_blocks,
                 retry_index=retries,
+                record_step=_record_step,
             )
             _record_step(
                 "rule_regenerate",

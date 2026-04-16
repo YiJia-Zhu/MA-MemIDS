@@ -23,10 +23,10 @@ pip install -r requirements.txt
 python main.py stats
 
 # 阶段一：从基础规则初始化
-python main.py init --rules /path/to/base.rules
+python main.py init --rules ./rules
 
 # 阶段一：从规则目录初始化（可限制数量）
-python main.py init --rules /mnt/8T/xgr/zhuyijia/MA_MemIDS/rules --max-rules 200
+python main.py init --rules ./rules --max-rules 100000
 
 # 可选：先单独预构建知识索引，再在 init/process 时只读缓存
 python main.py \
@@ -60,7 +60,8 @@ MA_MemIDS/
 ├── scripts/
 │   ├── run_xss_from_gridai.sh   # 直接跑 GRIDAI 的 xss_sample.pcap
 │   ├── generate_sandbox_pcaps.py# 生成沙盒验证用 benign/attack pcap
-│   └── build_knowledge_index.py # 预构建知识检索缓存（Sparse/Dense）
+│   ├── build_knowledge_index.py # 预构建知识检索缓存（Sparse/Dense）
+│   └── build_gridai_pseudo_gt.py# 复现 GRIDAI 风格的 sample->GT rule SID->new/repair 伪标签
 ├── demo/                        # 项目演示网页（交互式）
 │   ├── index.html
 │   ├── styles.css
@@ -125,10 +126,213 @@ Prompt 全在：
   - 输入规则文件或目录，构建规则 Note 和邻接图（支持 `--max-rules`）
 - `main.py process`
   - 输入 `--pcap` 或 `--traffic-text`，执行阶段二在线流程
+- `main.py process-batch`
+  - 输入 `--pcap-dir`，批量处理目录中的 `pcap/pcapng/cap`，支持断点续跑
 - `main.py export`
   - 导出当前规则库
 - `main.py stats`
   - 查看当前 Note 数、规则数、模型名、阈值
+
+### 4.1.1 Init 怎么跑
+
+单文件规则：
+
+```bash
+python main.py init --rules /path/to/base.rules
+```
+
+规则目录：
+
+```bash
+python main.py init --rules ./rules
+```
+
+限制初始化规模：
+
+```bash
+python main.py init --rules ./rules --max-rules 1000
+```
+
+### 4.1.2 Init 日志保存到哪里
+
+每次 `init/process/process-batch` 都会写到：
+
+- `memory/job_logs/<时间戳>_<kind>_<shortid>/`
+
+常用文件：
+
+- `command.sh`
+- `events.jsonl`
+- `progress.json`
+- `progress.jsonl`
+- `llm_calls.jsonl`
+- `tool_calls.jsonl`
+- `summary.json`
+- `result.json`
+- `error.json`
+
+其中：
+
+- `kind=init` 表示规则初始化
+- `kind=process` 表示单个 pcap 处理
+- `kind=process_batch` 表示批量 pcap 处理
+
+### 4.1.3 Init 的 resume 怎么做
+
+`init` 默认开启断点续跑，不需要额外加参数。
+
+第一次启动：
+
+```bash
+python main.py init --rules ./rules --max-rules 100000
+```
+
+如果中途停止，再次执行同一条命令即可继续：
+
+```bash
+python main.py init --rules ./rules --max-rules 100000
+```
+
+`init` 的 checkpoint 保存在：
+
+- `memory/checkpoints/init_*`
+
+实现方式是：
+
+- `references.jsonl`：每条 rule 的 reference 解析结果，按 `rule_index` 追加保存，可直接提取复用
+- 每处理完一个 rule note，就先追加写入 checkpoint journal
+- 重启后会优先复用 `references.jsonl` 中已完成的 reference 结果，只继续补剩余未完成部分
+- URL reference 如果命中 `memory/reference_cache`，会直接复用缓存结果，不再重新访问网络
+- 全部完成后，再统一合并进 `memory/state.json`
+- checkpoint 默认保留，不会在成功完成后自动删除，方便后续提取和检查
+
+如果你想强制从头跑，不使用断点续跑：
+
+```bash
+python main.py init --rules ./rules --max-rules 100000 --no-resume
+```
+
+### 4.1.4 单个 PCAP 怎么运行
+
+```bash
+python main.py process \
+  --pcap /path/to/sample.pcap \
+  --attack-pcaps /path/to/attack1.pcap,/path/to/attack2.pcap \
+  --benign-pcaps /path/to/benign1.pcap,/path/to/benign2.pcap
+```
+
+如果主分析样本本身就是攻击样本，也可以先这样最小运行：
+
+```bash
+python main.py process \
+  --pcap /path/to/sample.pcap \
+  --attack-pcaps /path/to/sample.pcap
+```
+
+`process` 每次只处理一个 `pcap`，处理完成后会立即写回当前 `state.json`，所以天然支持“一个 pcap 一个 pcap 地停下再继续”。
+
+### 4.1.5 批量 PCAP 怎么运行
+
+```bash
+python main.py process-batch \
+  --pcap-dir /path/to/pcap_dir \
+  --attack-pcaps /path/to/attack1.pcap,/path/to/attack2.pcap \
+  --benign-pcaps /path/to/benign1.pcap,/path/to/benign2.pcap
+```
+
+按攻击类别做“类别外串行、类别内分批并行分析”：
+
+```bash
+python main.py process-batch \
+  --pcap-dir /path/to/pcap_dir \
+  --category-batch-size 4 \
+  --category-parallelism 4
+```
+
+说明：
+
+- `--category-batch-size 1` 时，逻辑与旧版完全一致，仍然是逐个 `pcap` 串行处理
+- 当 `--category-batch-size > 1` 时，系统会先按攻击类别分组；同一类别内每批先并行做草稿分析，再串行提交到共享图谱/规则库
+- `--category-parallelism` 只影响类别内部草稿分析阶段，不会并发写同一个 `state.json`
+
+限制批量处理数量：
+
+```bash
+python main.py process-batch \
+  --pcap-dir /path/to/pcap_dir \
+  --limit 200
+```
+
+### 4.1.6 批量 PCAP 的 resume 怎么做
+
+`process-batch` 默认开启断点续跑。
+
+如果中途停止，再次执行同一条命令即可继续，已完成的 `pcap` 会自动跳过。
+
+`process-batch` 的 checkpoint 保存在：
+
+- `memory/checkpoints/process_batch_*`
+
+实现方式是：
+
+- 每处理完一个 `pcap`，就立刻把结果追加写入 checkpoint journal
+- 同时立刻执行一次 `save_state()`
+- 下次启动时按 `pcap_path` 跳过已完成项
+
+如果你想强制从头跑，不使用断点续跑：
+
+```bash
+python main.py process-batch \
+  --pcap-dir /path/to/pcap_dir \
+  --no-resume
+```
+
+### 4.1.7 GRIDAI 风格伪标签怎么构造
+
+第一步：用完整 ET 规则给攻击样本收集所有命中 SID，并导出人工标注模板：
+
+```bash
+python scripts/build_gridai_pseudo_gt.py collect \
+  --manifest IDS_dataset/prepared/manifest.tsv \
+  --label attack \
+  --rules-dir ./rules \
+  --output-dir output/gridai_pseudo_gt
+```
+
+这一阶段会输出：
+
+- `sample_alerts.jsonl`：每个样本的原始 alert 列表
+- `sample_sid_candidates.tsv`：每个样本命中的全部 SID 候选及排序分数
+- `sample_gt_template.tsv`：人工填写 `curated_gt_sid` 的模板
+- `sid_group_summary.tsv`：按建议 SID 聚合的样本分组概览
+
+第二步：你人工填写 `sample_gt_template.tsv` 里的 `curated_gt_sid` 后，生成 GRIDAI 风格的 `new/repair` 伪标签：
+
+```bash
+python scripts/build_gridai_pseudo_gt.py derive \
+  --curation-tsv output/gridai_pseudo_gt/sample_gt_template.tsv \
+  --output-dir output/gridai_pseudo_gt
+```
+
+这一步会输出：
+
+- `gridai_pseudo_labels.tsv`
+- `gridai_pseudo_labels.jsonl`
+- `gridai_gt_rule_groups.tsv`
+
+标签逻辑与 GRIDAI 一致：
+
+- 对同一个 `GT_rule_sid`，第一次出现记为 `new-rule-generation`
+- 后续再次出现记为 `rule-repair`
+
+如果你只是想先快速得到一个自动版伪标签，也可以临时使用建议 SID 兜底：
+
+```bash
+python scripts/build_gridai_pseudo_gt.py derive \
+  --curation-tsv output/gridai_pseudo_gt/sample_gt_template.tsv \
+  --output-dir output/gridai_pseudo_gt \
+  --use-suggested-when-missing
+```
 
 ### 4.2 核心编排
 

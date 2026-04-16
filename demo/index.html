@@ -32,7 +32,17 @@
         <p id="status-line">Checking...</p>
       </div>
       <button class="btn" id="btn-refresh">Refresh Status</button>
+      <button class="btn btn-ghost" id="btn-clear-outputs" type="button">CLEAR Outputs</button>
       <pre id="status-json" class="codebox"></pre>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <h2>Recent Runs</h2>
+        <p>网页端与终端 <code>main.py init/process</code> 会统一记录到本地</p>
+      </div>
+      <button class="btn btn-ghost" id="btn-recent-jobs" type="button">Refresh Recent Runs</button>
+      <pre id="recent-jobs" class="codebox"></pre>
     </section>
 
     <section class="panel reveal">
@@ -146,16 +156,35 @@
           <input type="number" name="max_rules" min="0" value="200" />
         </label>
         <button class="btn" id="init-submit" type="submit">Run Init</button>
+        <button class="btn btn-ghost" id="init-show-command" type="button">查看终端命令</button>
+        <button class="btn btn-ghost" id="init-clear" type="button">CLEAR</button>
       </form>
+
+      <details class="fold-block">
+        <summary>Init Terminal Command</summary>
+        <pre id="init-command" class="codebox"></pre>
+      </details>
 
       <details class="fold-block" open>
         <summary>Init Live Progress</summary>
+        <div class="progress-wrap">
+          <progress id="init-progress-bar" max="100" value="0"></progress>
+          <span id="init-progress-text" class="progress-text">0%</span>
+        </div>
         <p id="init-live-status" class="live-status">Idle</p>
         <div id="init-live" class="event-list"></div>
       </details>
       <details class="fold-block" open>
         <summary>Init Response</summary>
         <pre id="init-output" class="codebox"></pre>
+      </details>
+      <details class="fold-block">
+        <summary>Init LLM Calls</summary>
+        <pre id="init-llm-calls" class="codebox"></pre>
+      </details>
+      <details class="fold-block">
+        <summary>Init Tool Calls</summary>
+        <pre id="init-tool-calls" class="codebox"></pre>
       </details>
     </section>
 
@@ -200,7 +229,14 @@
           <input type="text" name="override_keywords" placeholder="<script>,alert,xss" />
         </label>
         <button class="btn" id="process-submit" type="submit">Run Process</button>
+        <button class="btn btn-ghost" id="process-show-command" type="button">查看终端命令</button>
+        <button class="btn btn-ghost" id="process-clear" type="button">CLEAR</button>
       </form>
+
+      <details class="fold-block">
+        <summary>Process Terminal Command</summary>
+        <pre id="process-command" class="codebox"></pre>
+      </details>
 
       <div class="fold-tools">
         <button type="button" class="btn btn-ghost" id="btn-expand-all">Expand All</button>
@@ -209,6 +245,10 @@
 
       <details class="fold-block" open>
         <summary>Process Live Progress</summary>
+        <div class="progress-wrap">
+          <progress id="process-progress-bar" max="100" value="0"></progress>
+          <span id="process-progress-text" class="progress-text">0%</span>
+        </div>
         <p id="process-live-status" class="live-status">Idle</p>
         <div id="process-live" class="event-list"></div>
       </details>
@@ -226,6 +266,10 @@
       <details class="fold-block">
         <summary>LLM Calls (prompt / response)</summary>
         <pre id="llm-calls" class="codebox"></pre>
+      </details>
+      <details class="fold-block">
+        <summary>Tool Calls</summary>
+        <pre id="tool-calls" class="codebox"></pre>
       </details>
     </section>
   </main>
