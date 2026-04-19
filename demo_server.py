@@ -28,13 +28,14 @@ except ImportError:
 from ma_memids.graph import NoteGraph
 from ma_memids.llm_client import BaseLLMClient, create_llm_client
 from ma_memids.knowledge import load_knowledge_source_registry
+from ma_memids.models import Note
 from ma_memids.pipeline import MAMemIDSPipeline
 from ma_memids.run_trace import RunArtifacts, TracingLLMClient
 
 
 ROOT = Path(__file__).resolve().parent
 DEMO_DIR = ROOT / "demo"
-STATE_PATH = ROOT / "memory" / "state.json"
+LIVE_STATE_PATH = ROOT / "memory" / "state.json"
 LOG_PATH = ROOT / "memory" / "demo_server.log"
 DEFAULT_RULES_PATH = ROOT / "rules"
 DEFAULT_SANDBOX_ROOT = ROOT / "sandbox_samples"
@@ -42,6 +43,8 @@ DEFAULT_ATTACK_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "attack"
 DEFAULT_BENIGN_SANDBOX_DIR = DEFAULT_SANDBOX_ROOT / "benign"
 DEFAULT_KNOWLEDGE_CACHE_DIR = ROOT / "memory" / "knowledge_cache"
 JOB_LOG_ROOT = ROOT / "memory" / "job_logs"
+GRAPH_STATE_PATH_ENV = "MA_MEMIDS_DEMO_GRAPH_STATE_PATH"
+GRAPH_LOG_DIR_ENV = "MA_MEMIDS_DEMO_GRAPH_LOG_DIR"
 
 MAX_JOB_EVENTS = 1200
 MAX_JOBS = 120
@@ -53,6 +56,7 @@ STATE_SNAPSHOT_CACHE: Dict[str, Any] = {
     "graph": None,
     "raw": None,
     "mtime_ns": None,
+    "path": None,
 }
 PIPELINE_CACHE_LOCK = threading.Condition(threading.Lock())
 PIPELINE_CACHE: Dict[str, Any] = {
@@ -166,7 +170,7 @@ def _build_pipeline(
     setup = _resolve_pipeline_setup()
     _log_pipeline_setup(setup, context=context)
     return MAMemIDSPipeline(
-        state_path=str(STATE_PATH),
+        state_path=str(LIVE_STATE_PATH),
         llm_client=llm_client,
         llm_model=(None if llm_client is not None else llm_model),
         cve_knowledge_path=setup["cve_kb"] or None,
@@ -207,10 +211,191 @@ def _shared_pipeline_cache_key() -> tuple[str, str, str, str]:
     )
 
 
-def _current_state_mtime_ns() -> Optional[int]:
-    if not STATE_PATH.exists():
+def _read_json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalize_optional_int(value: Any) -> Optional[int]:
+    if value in (None, "", 0, "0"):
         return None
-    return STATE_PATH.stat().st_mtime_ns
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _capture_state_snapshot(log_dir: str | Path, state_path: str | Path = LIVE_STATE_PATH) -> Optional[Path]:
+    resolved_log_dir = _resolve_app_path(str(log_dir))
+    resolved_log_dir.mkdir(parents=True, exist_ok=True)
+    source_path = _resolve_app_path(str(state_path))
+    if not source_path.exists():
+        return None
+
+    snapshot_path = resolved_log_dir / "state_snapshot.json"
+    shutil.copy2(source_path, snapshot_path)
+    _write_json_file(
+        resolved_log_dir / "state_snapshot_meta.json",
+        {
+            "source_state_path": str(source_path),
+            "snapshot_path": str(snapshot_path),
+            "captured_at": _now_iso(),
+        },
+    )
+    return snapshot_path
+
+
+def _find_matching_init_checkpoint(source_path: str, max_rules: Optional[int]) -> Optional[Path]:
+    checkpoint_root = LIVE_STATE_PATH.parent / "checkpoints"
+    requested_source = _resolve_app_path(source_path)
+    candidates: List[tuple[str, Path]] = []
+    for meta_path in checkpoint_root.glob("init_*/meta.json"):
+        try:
+            meta = _read_json_file(meta_path)
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        checkpoint_source = str(meta.get("source_path") or "").strip()
+        if not checkpoint_source:
+            continue
+        if _resolve_app_path(checkpoint_source) != requested_source:
+            continue
+        if _normalize_optional_int(meta.get("max_rules")) != max_rules:
+            continue
+        candidates.append((str(meta.get("updated_at") or ""), meta_path.parent))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _materialize_state_snapshot_from_job_log(log_dir: str | Path) -> Optional[Path]:
+    resolved_log_dir = _resolve_app_path(str(log_dir))
+    snapshot_path = resolved_log_dir / "state_snapshot.json"
+    if snapshot_path.exists():
+        return snapshot_path
+
+    request_path = resolved_log_dir / "request.json"
+    meta_path = resolved_log_dir / "meta.json"
+    if not request_path.exists() or not meta_path.exists():
+        return None
+
+    try:
+        meta = _read_json_file(meta_path)
+        request_payload = _read_json_file(request_path)
+    except Exception as exc:
+        LOGGER.warning("failed to read job metadata for %s: %s", resolved_log_dir, exc)
+        return None
+
+    if not isinstance(meta, dict) or str(meta.get("kind") or "").strip() != "init":
+        return None
+    if not isinstance(request_payload, dict):
+        return None
+
+    rules_path = str(request_payload.get("rules") or request_payload.get("rules_path") or "").strip()
+    if not rules_path:
+        return None
+    max_rules = _normalize_optional_int(request_payload.get("max_rules"))
+    checkpoint_dir = _find_matching_init_checkpoint(rules_path, max_rules)
+    if checkpoint_dir is None:
+        LOGGER.warning("no matching init checkpoint found for %s", resolved_log_dir)
+        return None
+
+    notes_path = checkpoint_dir / "notes.jsonl"
+    if not notes_path.exists():
+        return None
+
+    notes: List[Note] = []
+    with notes_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(raw, dict):
+                notes.append(Note.from_dict(raw))
+
+    graph = NoteGraph()
+    graph.add_or_update_many(notes)
+
+    base_raw: Dict[str, Any] = {}
+    if LIVE_STATE_PATH.exists():
+        try:
+            live_raw = _read_json_file(LIVE_STATE_PATH)
+        except Exception:
+            live_raw = {}
+        if isinstance(live_raw, dict):
+            if isinstance(live_raw.get("embedding"), dict):
+                base_raw["embedding"] = live_raw["embedding"]
+            if isinstance(live_raw.get("sandbox_baseline"), dict):
+                base_raw["sandbox_baseline"] = live_raw["sandbox_baseline"]
+
+    payload = {
+        "graph": graph.to_dict(),
+        "embedding": base_raw.get("embedding", {}),
+        "sandbox_baseline": base_raw.get("sandbox_baseline", {}),
+        "snapshot_source": {
+            "job_log_dir": str(resolved_log_dir),
+            "checkpoint_dir": str(checkpoint_dir),
+            "rules_path": str(_resolve_app_path(rules_path)),
+            "max_rules": max_rules,
+            "note_count": len(notes),
+            "generated_at": _now_iso(),
+        },
+    }
+    _write_json_file(snapshot_path, payload)
+    _write_json_file(
+        resolved_log_dir / "state_snapshot_meta.json",
+        {
+            "source": "checkpoint_materialized",
+            "snapshot_path": str(snapshot_path),
+            "job_log_dir": str(resolved_log_dir),
+            "checkpoint_dir": str(checkpoint_dir),
+            "captured_at": _now_iso(),
+            "note_count": len(notes),
+        },
+    )
+    LOGGER.info("materialized state snapshot for %s from %s", resolved_log_dir, checkpoint_dir)
+    return snapshot_path
+
+
+def _graph_state_path() -> Path:
+    log_dir_override = (os.getenv(GRAPH_LOG_DIR_ENV) or "").strip()
+    if log_dir_override:
+        resolved_log_dir = _resolve_app_path(log_dir_override)
+        snapshot_path = resolved_log_dir / "state_snapshot.json"
+        if snapshot_path.exists():
+            return snapshot_path
+        materialized = _materialize_state_snapshot_from_job_log(resolved_log_dir)
+        if materialized is not None:
+            return materialized
+        LOGGER.warning(
+            "%s is set to %s but no state snapshot is available; falling back to live state",
+            GRAPH_LOG_DIR_ENV,
+            resolved_log_dir,
+        )
+
+    state_path_override = (os.getenv(GRAPH_STATE_PATH_ENV) or "").strip()
+    if state_path_override:
+        return _resolve_app_path(state_path_override)
+    return LIVE_STATE_PATH
+
+
+def _current_live_state_mtime_ns() -> Optional[int]:
+    if not LIVE_STATE_PATH.exists():
+        return None
+    return LIVE_STATE_PATH.stat().st_mtime_ns
+
+
+def _current_graph_state_signature() -> tuple[str, Optional[int]]:
+    state_path = _graph_state_path()
+    mtime_ns = state_path.stat().st_mtime_ns if state_path.exists() else None
+    return str(state_path), mtime_ns
 
 
 def _invalidate_state_snapshot(reason: str) -> None:
@@ -218,21 +403,24 @@ def _invalidate_state_snapshot(reason: str) -> None:
         STATE_SNAPSHOT_CACHE["graph"] = None
         STATE_SNAPSHOT_CACHE["raw"] = None
         STATE_SNAPSHOT_CACHE["mtime_ns"] = None
+        STATE_SNAPSHOT_CACHE["path"] = None
     LOGGER.info("demo state snapshot invalidated: %s", reason)
 
 
 def _get_state_snapshot() -> tuple[NoteGraph, Dict[str, Any]]:
-    state_mtime_ns = _current_state_mtime_ns()
+    state_path_str, state_mtime_ns = _current_graph_state_signature()
+    state_path = Path(state_path_str)
     with STATE_SNAPSHOT_LOCK:
         if (
             STATE_SNAPSHOT_CACHE["graph"] is not None
             and STATE_SNAPSHOT_CACHE["raw"] is not None
             and STATE_SNAPSHOT_CACHE["mtime_ns"] == state_mtime_ns
+            and STATE_SNAPSHOT_CACHE["path"] == state_path_str
         ):
             return STATE_SNAPSHOT_CACHE["graph"], STATE_SNAPSHOT_CACHE["raw"]
 
-    if STATE_PATH.exists():
-        raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    if state_path.exists():
+        raw = _read_json_file(state_path)
     else:
         raw = {}
     graph_data = raw.get("graph") if isinstance(raw, dict) else {}
@@ -242,6 +430,7 @@ def _get_state_snapshot() -> tuple[NoteGraph, Dict[str, Any]]:
         STATE_SNAPSHOT_CACHE["graph"] = graph
         STATE_SNAPSHOT_CACHE["raw"] = raw
         STATE_SNAPSHOT_CACHE["mtime_ns"] = state_mtime_ns
+        STATE_SNAPSHOT_CACHE["path"] = state_path_str
     return graph, raw
 
 
@@ -250,6 +439,7 @@ def _state_stats_payload(graph: NoteGraph, raw: Dict[str, Any]) -> Dict[str, Any
     rule_notes = [n for n in notes if n.note_type == "rule"]
     baseline = raw.get("sandbox_baseline") if isinstance(raw, dict) else {}
     embedding = raw.get("embedding") if isinstance(raw, dict) else {}
+    active_state_path = _graph_state_path()
     knowledge_cache_dir = _resolve_app_path(os.getenv("MA_MEMIDS_KNOWLEDGE_CACHE_DIR", str(DEFAULT_KNOWLEDGE_CACHE_DIR)))
     knowledge_sources = load_knowledge_source_registry(knowledge_cache_dir)
     return {
@@ -265,6 +455,11 @@ def _state_stats_payload(graph: NoteGraph, raw: Dict[str, Any]) -> Dict[str, Any
         "thresholds": graph.thresholds.__dict__,
         "graph_index": graph.index_stats(),
         "sandbox_baseline": baseline if isinstance(baseline, dict) else {},
+        "state": {
+            "path": str(active_state_path),
+            "live_path": str(LIVE_STATE_PATH),
+            "is_live": active_state_path == LIVE_STATE_PATH,
+        },
     }
 
 
@@ -310,7 +505,7 @@ def _invalidate_shared_pipeline(reason: str) -> None:
 
 def _get_shared_pipeline() -> MAMemIDSPipeline:
     cache_key = _shared_pipeline_cache_key()
-    state_mtime_ns = _current_state_mtime_ns()
+    state_mtime_ns = _current_live_state_mtime_ns()
 
     with PIPELINE_CACHE_LOCK:
         while PIPELINE_CACHE["building"]:
@@ -1122,7 +1317,7 @@ def api_status() -> Any:
         {
             "ok": True,
             "stats": _state_stats_payload(graph, raw),
-            "state_path": str(STATE_PATH),
+            "state_path": str(_graph_state_path()),
             "default_rules_path": _display_app_path(
                 os.getenv("MA_MEMIDS_DEFAULT_RULES_PATH", str(DEFAULT_RULES_PATH))
             ),
@@ -1152,7 +1347,7 @@ def api_graph_summary() -> Any:
                 "rule_notes": len(rule_notes),
                 "traffic_notes": 0,
                 "total_links": total_links,
-                "state_path": str(STATE_PATH),
+                "state_path": str(_graph_state_path()),
                 "knowledge": _state_stats_payload(graph, raw).get("knowledge"),
             },
             "latest_notes": [_note_preview(n) for n in latest_notes],
@@ -1359,21 +1554,31 @@ def api_graph_clear() -> Any:
     confirm = str(data.get("confirm") or request.form.get("confirm") or "").strip().upper()
     if confirm != "CLEAR":
         return jsonify({"ok": False, "error": "confirmation required: set confirm=CLEAR"}), 400
+    if _graph_state_path() != LIVE_STATE_PATH:
+        return jsonify(
+            {
+                "ok": False,
+                "error": (
+                    "graph clear is disabled while viewing an alternate snapshot; "
+                    f"unset {GRAPH_LOG_DIR_ENV}/{GRAPH_STATE_PATH_ENV} to clear the live state"
+                ),
+            }
+        ), 400
 
     graph, raw = _get_state_snapshot()
     before = _state_stats_payload(graph, raw)
 
     backup_path = None
-    if STATE_PATH.exists():
+    if LIVE_STATE_PATH.exists():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = STATE_PATH.with_name(f"state.backup.{ts}.json")
-        shutil.copy2(STATE_PATH, backup_file)
+        backup_file = LIVE_STATE_PATH.with_name(f"state.backup.{ts}.json")
+        shutil.copy2(LIVE_STATE_PATH, backup_file)
         backup_path = str(backup_file)
 
     graph.notes.clear()
     state_payload = dict(raw) if isinstance(raw, dict) else {}
     state_payload["graph"] = graph.to_dict()
-    STATE_PATH.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    LIVE_STATE_PATH.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _invalidate_shared_pipeline("graph_clear")
     after = _state_stats_payload(graph, state_payload)
 
@@ -1400,6 +1605,7 @@ def api_init() -> Any:
         artifacts = RunArtifacts(log_dir, kind="init", source="web")
         progress_callback = lambda event: artifacts.record_progress(event)
         payload = _run_init_payload(init_args, artifacts, progress_callback=progress_callback)
+        _capture_state_snapshot(log_dir)
         artifacts.finalize(status="succeeded", result=payload)
         return jsonify(payload)
     except Exception as exc:
@@ -1424,6 +1630,7 @@ def api_process() -> Any:
         artifacts = RunArtifacts(log_dir, kind="process", source="web")
         progress_callback = lambda event: artifacts.record_progress(event)
         payload = _run_process_payload(process_args, artifacts, progress_callback=progress_callback)
+        _capture_state_snapshot(log_dir)
         artifacts.finalize(status="succeeded", result=payload)
         return jsonify(payload)
     except Exception as exc:
@@ -1469,6 +1676,7 @@ def api_init_async() -> Any:
             )
             progress_callback({"event": "job_done"})
             _append_job_event(job_id, "status", "init_task_done", {"initialized_rules": payload["initialized_rules"]})
+            _capture_state_snapshot(log_dir)
             artifacts.finalize(status="succeeded", result=payload)
             _finish_job_success(job_id, payload)
         except Exception as exc:
@@ -1528,6 +1736,7 @@ def api_process_async() -> Any:
                     "mode": payload["outcome"]["result"]["mode"],
                 },
             )
+            _capture_state_snapshot(log_dir)
             artifacts.finalize(status="succeeded", result=payload)
             _finish_job_success(job_id, payload)
         except Exception as exc:

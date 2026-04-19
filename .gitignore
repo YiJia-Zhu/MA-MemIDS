@@ -9,6 +9,7 @@ knowledge/*
 huggingface_models/*
 output/*
 rules/*
+work_week
 
 !huggingface_models/huggingface_download.sh
 !knowledge/.gitkeep

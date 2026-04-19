@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import shlex
+import shutil
 import sys
 import time
 import traceback
@@ -276,6 +277,26 @@ def _log_cli_job_finish(log_dir: Path, *, status: str, result=None, error: str |
     _write_json(JOB_LOG_ROOT / f"latest_{snapshot['kind']}.json", {"job_id": snapshot["job_id"], "kind": snapshot["kind"], "source": snapshot["source"], "log_dir": str(log_dir), "updated_at": snapshot["updated_at"]})
 
 
+def _capture_state_snapshot(log_dir: Path, state_path: str) -> None:
+    source_path = Path(state_path).expanduser()
+    if not source_path.is_absolute():
+        source_path = ROOT / source_path
+    source_path = source_path.resolve(strict=False)
+    if not source_path.exists():
+        return
+
+    snapshot_path = log_dir / "state_snapshot.json"
+    shutil.copy2(source_path, snapshot_path)
+    _write_json(
+        log_dir / "state_snapshot_meta.json",
+        {
+            "source_state_path": str(source_path),
+            "snapshot_path": str(snapshot_path),
+            "captured_at": _now_iso(),
+        },
+    )
+
+
 def _make_tool_callback(artifacts: RunArtifacts, sink: list[dict]) -> Callable[[dict], None]:
     def _callback(payload: dict) -> None:
         record = artifacts.record_tool_call(
@@ -478,6 +499,7 @@ def main() -> None:
                 "llm_call_count": len(llm_calls),
                 "tool_call_count": len(tool_calls),
             }
+            _capture_state_snapshot(log_dir, args.state)
             _log_cli_job_event(log_dir, "status", "init_done", {"initialized_rules": count})
             artifacts.finalize(status="succeeded", result=result)
             _log_cli_job_finish(log_dir, status="succeeded", result=result)
@@ -573,6 +595,7 @@ def main() -> None:
                 "llm_call_count": len(llm_calls),
                 "tool_call_count": len(tool_calls),
             }
+            _capture_state_snapshot(log_dir, args.state)
             _log_cli_job_event(
                 log_dir,
                 "status",
@@ -892,6 +915,7 @@ def main() -> None:
                 "llm_call_count": len(llm_calls),
                 "tool_call_count": len(tool_calls),
             }
+            _capture_state_snapshot(log_dir, args.state)
             artifacts.finalize(status="succeeded", result=result_payload)
             _log_cli_job_finish(log_dir, status="succeeded", result=result_payload)
             print(json.dumps({"completed_count": completed_count, "pcap_count": len(pcaps), "log_dir": str(log_dir)}, ensure_ascii=False, indent=2))
